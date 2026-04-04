@@ -1,0 +1,274 @@
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=IBM+Plex+Mono:wght@400;600&display=swap");
+
+:root {
+  --bg-a: #f8f5ee;
+  --bg-b: #e8f3ef;
+  --card: #ffffff;
+  --text: #102a43;
+  --muted: #486581;
+  --accent: #0f766e;
+  --accent-strong: #115e59;
+  --chip: #d8f3dc;
+  --danger: #b42318;
+  --shadow: 0 14px 30px rgba(16, 42, 67, 0.12);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--text);
+  font-family: "Space Grotesk", "Segoe UI", sans-serif;
+  background: radial-gradient(circle at 20% 10%, #fff6d4 0%, transparent 36%),
+    radial-gradient(circle at 85% 20%, #c7f2e3 0%, transparent 33%),
+    linear-gradient(130deg, var(--bg-a) 0%, var(--bg-b) 100%);
+}
+
+a {
+  color: inherit;
+}
+
+.app-shell {
+  width: min(1100px, 100% - 2rem);
+  margin: 1.5rem auto 3rem;
+}
+
+.topbar {
+  background: var(--card);
+  border-radius: 18px;
+  padding: 1.1rem 1.2rem;
+  box-shadow: var(--shadow);
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.brand-kicker {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.brand-title {
+  margin: 0.15rem 0 0;
+  font-size: 2rem;
+}
+
+.engine-panel {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.engine-panel label {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.engine-panel select {
+  border: 1px solid #9fb3c8;
+  border-radius: 10px;
+  padding: 0.55rem 0.7rem;
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.nav-row {
+  margin-top: 1rem;
+  display: flex;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.nav-link {
+  text-decoration: none;
+  padding: 0.5rem 1rem;
+  border-radius: 999px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid rgba(15, 118, 110, 0.2);
+}
+
+.nav-link.active {
+  background: var(--accent);
+  color: white;
+  border-color: transparent;
+}
+
+.page-content {
+  margin-top: 1rem;
+  display: grid;
+  gap: 1rem;
+}
+
+.hero-card,
+.result-card,
+.detail-card,
+.answer-card,
+.query-card,
+.tag-card,
+.table-wrap {
+  background: var(--card);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+}
+
+.hero-card {
+  padding: 1.2rem;
+}
+
+.hero-card h2,
+.detail-card h2,
+h2,
+h3 {
+  margin-top: 0;
+}
+
+.search-form {
+  margin-top: 0.7rem;
+  display: grid;
+  gap: 0.7rem;
+  grid-template-columns: 1fr 1fr auto;
+}
+
+.search-form input {
+  padding: 0.6rem 0.75rem;
+  border-radius: 10px;
+  border: 1px solid #c5d2de;
+  font-size: 0.95rem;
+}
+
+.search-form button,
+.inline-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.6rem 0.95rem;
+  border-radius: 10px;
+  border: 0;
+  text-decoration: none;
+  background: var(--accent);
+  color: white;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.search-form button:hover,
+.inline-link:hover {
+  background: var(--accent-strong);
+}
+
+.result-list,
+.answer-list,
+.tag-grid {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.result-card,
+.detail-card,
+.answer-card,
+.query-card,
+.tag-card {
+  padding: 1rem;
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin: 0.6rem 0;
+}
+
+.chip {
+  background: var(--chip);
+  color: #0b3d2e;
+  border-radius: 999px;
+  padding: 0.24rem 0.56rem;
+  font-size: 0.82rem;
+}
+
+.result-metrics,
+.meta-row,
+.page-lead,
+.answer-meta {
+  color: var(--muted);
+  margin: 0.4rem 0 0;
+}
+
+.status {
+  margin: 0;
+  padding: 0.75rem 1rem;
+  border-radius: 12px;
+  font-weight: 600;
+}
+
+.status.loading {
+  background: #e0f2fe;
+  color: #075985;
+}
+
+.status.error {
+  background: #fee4e2;
+  color: var(--danger);
+}
+
+.detail-wrap {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.query-card pre {
+  margin: 0;
+  white-space: pre-wrap;
+  font-family: "IBM Plex Mono", monospace;
+  background: #f7fafc;
+  border-radius: 8px;
+  padding: 0.7rem;
+  overflow-x: auto;
+}
+
+.tag-grid {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.table-wrap {
+  overflow-x: auto;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+th,
+td {
+  border-bottom: 1px solid #d8e2eb;
+  padding: 0.75rem;
+  text-align: left;
+}
+
+th {
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+
+@media (max-width: 860px) {
+  .search-form {
+    grid-template-columns: 1fr;
+  }
+
+  .topbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .brand-title {
+    font-size: 1.7rem;
+  }
+}
