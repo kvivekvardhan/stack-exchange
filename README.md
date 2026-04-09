@@ -134,7 +134,24 @@ cd backend && npm install
 cd ../frontend && npm install
 ```
 
-### 2. Start backend
+### 2. Configure backend environment
+
+```bash
+cd backend
+cp .env.example .env
+```
+
+Update `DATABASE_URL` in `backend/.env` so it points to your PostgreSQL instance.
+
+### 3. Initialize and seed PostgreSQL
+
+```bash
+cd backend
+npm run db:init
+npm run db:seed
+```
+
+### 4. Start backend
 
 ```bash
 cd backend
@@ -143,7 +160,7 @@ npm run dev
 
 Backend runs at `http://localhost:4000`.
 
-### 3. Start frontend
+### 5. Start frontend
 
 In a second terminal:
 

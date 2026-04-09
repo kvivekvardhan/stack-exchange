@@ -5,11 +5,16 @@
   "type": "module",
   "scripts": {
     "dev": "nodemon src/server.js",
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "db:init": "node src/db/initDb.js",
+    "db:seed": "node src/db/seedDb.js",
+    "db:reset": "npm run db:init && npm run db:seed"
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^4.19.2"
+    "dotenv": "^17.4.1",
+    "express": "^4.19.2",
+    "pg": "^8.20.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"

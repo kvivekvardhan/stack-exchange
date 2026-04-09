@@ -1,7 +1,11 @@
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:4000";
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "/api";
 
 function buildUrl(path, params = {}) {
-  const url = new URL(`${API_BASE_URL}${path}`);
+  const normalizedBase = API_BASE_URL.endsWith("/")
+    ? API_BASE_URL.slice(0, -1)
+    : API_BASE_URL;
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  const url = new URL(`${normalizedBase}${normalizedPath}`, window.location.origin);
   Object.entries(params).forEach(([key, value]) => {
     if (value !== undefined && value !== null && String(value).trim() !== "") {
       url.searchParams.set(key, value);

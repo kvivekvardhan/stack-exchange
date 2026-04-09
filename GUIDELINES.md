@@ -7,6 +7,7 @@ This document explains how to set up, run, and maintain the frontend and backend
 - Node.js 18+ (recommended: Node.js 20 LTS)
 - npm 9+
 - Git
+- PostgreSQL 14+
 
 Check versions:
 
@@ -43,8 +44,13 @@ Create `backend/.env`:
 
 ```env
 PORT=4000
-# For later DB integration:
-# DATABASE_URL=postgresql://username:password@localhost:5432/stackfast
+DATABASE_URL=postgresql://username:password@localhost:5432/stackfast
+```
+
+You can copy from the template and edit it:
+
+```bash
+cp backend/.env.example backend/.env
 ```
 
 ### Frontend `.env`
@@ -64,6 +70,16 @@ Notes:
 Open two terminals.
 
 ### Terminal 1: backend
+
+Initialize schema and seed data (first run, or when you want a reset):
+
+```bash
+cd backend
+npm run db:init
+npm run db:seed
+```
+
+Start backend:
 
 ```bash
 cd backend
@@ -108,7 +124,17 @@ curl http://localhost:4000/tags
 curl http://localhost:4000/benchmark
 ```
 
-## 8. Installing packages
+## 8. Database scripts
+
+Run from `backend/`:
+
+```bash
+npm run db:init   # create tables and indexes
+npm run db:seed   # seed initial sample data
+npm run db:reset  # init + seed
+```
+
+## 9. Installing packages
 
 Install dependencies in the correct folder.
 
@@ -144,7 +170,7 @@ npm install axios
 npm install -D <package-name>
 ```
 
-## 9. Common troubleshooting
+## 10. Common troubleshooting
 
 - Port in use:
   - Change `PORT` in `backend/.env`, or stop the process using that port.
@@ -152,10 +178,14 @@ npm install -D <package-name>
   - Confirm backend is running.
   - Confirm `VITE_API_BASE_URL` in `frontend/.env`.
   - Restart frontend after `.env` changes.
+- Backend cannot connect to PostgreSQL:
+  - Confirm PostgreSQL is running and accessible.
+  - Verify `DATABASE_URL` in `backend/.env`.
+  - Re-run `npm run db:init` after fixing connection settings.
 - Dependency issues:
   - Delete `node_modules` and `package-lock.json` in affected folder, then run `npm install` again.
 
-## 10. Git workflow tip
+## 11. Git workflow tip
 
 Before committing, verify ignored files are not staged:
 
