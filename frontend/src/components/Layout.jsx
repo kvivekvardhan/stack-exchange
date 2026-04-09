@@ -1,43 +1,36 @@
 import { NavLink } from "react-router-dom";
 
 function navClassName({ isActive }) {
-  return isActive ? "nav-link active" : "nav-link";
+  return isActive ? "sidebar-link active" : "sidebar-link";
 }
 
-export default function Layout({ engine, onEngineChange, children }) {
+export default function Layout({ children }) {
   return (
-    <div className="app-shell">
-      <header className="topbar">
-        <div>
-          <p className="brand-kicker">CS349 checkpoint prototype</p>
-          <h1 className="brand-title">StackFast</h1>
-        </div>
-        <div className="engine-panel">
-          <label htmlFor="engine-select">Engine</label>
-          <select
-            id="engine-select"
-            value={engine}
-            onChange={(event) => onEngineChange(event.target.value)}
-          >
-            <option value="baseline">Baseline PostgreSQL</option>
-            <option value="vectorized">Vectorized PostgreSQL</option>
-          </select>
+    <div className="so-app">
+      <header className="so-topbar">
+        <div className="so-topbar-inner">
+          <div className="so-logo-wrap">
+            <span className="logo-bars" aria-hidden="true">
+              ///
+            </span>
+            <h1>StackFast</h1>
+          </div>
+          <p className="so-tagline">Developer Q&A</p>
         </div>
       </header>
-
-      <nav className="nav-row">
-        <NavLink to="/" className={navClassName} end>
-          Search
-        </NavLink>
-        <NavLink to="/tags" className={navClassName}>
-          Tags
-        </NavLink>
-        <NavLink to="/benchmark" className={navClassName}>
-          Benchmark
-        </NavLink>
-      </nav>
-
-      <main className="page-content">{children}</main>
+      <div className="so-layout">
+        <aside className="so-sidebar" aria-label="Main navigation">
+          <nav className="sidebar-nav">
+            <NavLink to="/" className={navClassName} end>
+              Home
+            </NavLink>
+            <NavLink to="/questions" className={navClassName}>
+              Questions
+            </NavLink>
+          </nav>
+        </aside>
+        <main className="so-main">{children}</main>
+      </div>
     </div>
   );
 }

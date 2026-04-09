@@ -10,8 +10,19 @@ function buildUrl(path, params = {}) {
   return url.toString();
 }
 
-async function request(path, params = {}) {
-  const response = await fetch(buildUrl(path, params));
+async function request(path, params = {}, options = {}) {
+  const headers = options.body
+    ? {
+        "Content-Type": "application/json",
+        ...(options.headers || {})
+      }
+    : options.headers;
+
+  const response = await fetch(buildUrl(path, params), {
+    method: options.method || "GET",
+    headers,
+    body: options.body ? JSON.stringify(options.body) : undefined
+  });
   const payload = await response.json();
 
   if (!response.ok) {
@@ -22,18 +33,59 @@ async function request(path, params = {}) {
   return payload;
 }
 
-export function searchQuestions({ q, tag, engine }) {
-  return request("/search", { q, tag, engine });
+export function searchQuestions({ q, tag }) {
+  return request("/search", { q, tag });
 }
 
-export function getQuestion(id, engine) {
-  return request(`/question/${id}`, { engine });
+export function getQuestion(id) {
+  return request(`/question/${id}`);
 }
 
-export function getTags() {
-  return request("/tags");
+export function createQuestion({ title, body, tags, author }) {
+  return request(
+    "/questions",
+    {},
+    {
+      method: "POST",
+      body: { title, body, tags, author }
+    }
+  );
 }
 
-export function getBenchmark() {
-  return request("/benchmark");
+export function upvoteQuestion(id) {
+  return request(`/question/${id}/upvote`, {}, { method: "POST" });
+}
+
+export function postAnswer(questionId, { body, author }) {
+  return request(
+    `/question/${questionId}/answers`,
+    {},
+    {
+      method: "POST",
+      body: { body, author }
+    }
+  );
+}
+
+export function upvoteAnswer(questionId, answerId) {
+  return request(`/question/${questionId}/answers/${answerId}/upvote`, {}, { method: "POST" });
+}
+
+export function postReply(questionId, answerId, { body, author }) {
+  return request(
+    `/question/${questionId}/answers/${answerId}/replies`,
+    {},
+    {
+      method: "POST",
+      body: { body, author }
+    }
+  );
+}
+
+export function upvoteReply(questionId, answerId, replyId) {
+  return request(
+    `/question/${questionId}/answers/${answerId}/replies/${replyId}/upvote`,
+    {},
+    { method: "POST" }
+  );
 }

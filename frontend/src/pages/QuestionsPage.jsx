@@ -3,7 +3,7 @@ import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { createQuestion } from "../api";
 
-export default function HomePage() {
+export default function QuestionsPage() {
   const navigate = useNavigate();
   const [askModalOpen, setAskModalOpen] = useState(false);
   const [title, setTitle] = useState("");
@@ -52,9 +52,10 @@ export default function HomePage() {
       </section>
 
       <QuestionFeed
-        title="Top Questions"
-        subtitle="Search and browse the top-scoring community questions."
-        previewLimit={4}
+        title="All Questions"
+        subtitle="Find questions by keyword and explore full results."
+        enableSorting
+        defaultSort="time_desc"
       />
 
       {askModalOpen && (
