@@ -1,6 +1,5 @@
 import cors from "cors";
 import express from "express";
-import { benchmarkSamples } from "./data/sampleData.js";
 import { query, withTransaction } from "./db/pool.js";
 
 const app = express();
@@ -602,68 +601,6 @@ app.post(
     });
   })
 );
-
-app.get(
-  "/tags",
-  asyncHandler(async (_req, res) => {
-    const start = process.hrtime.bigint();
-
-    const tagsResult = await query(
-      `
-      SELECT
-        t.name,
-        t.description,
-        COALESCE(COUNT(qt.question_id), 0)::int AS question_count
-      FROM tags t
-      LEFT JOIN question_tags qt ON qt.tag_id = t.id
-      GROUP BY t.id
-      ORDER BY question_count DESC, t.name ASC
-      `
-    );
-
-    const data = tagsResult.rows.map((item) => ({
-      name: item.name,
-      questionCount: item.question_count,
-      description: item.description || "No description available"
-    }));
-
-    const timingMs = Number(hrtimeToMs(start).toFixed(3));
-
-    res.json({
-      meta: {
-        timingMs,
-        totalTags: data.length
-      },
-      data
-    });
-  })
-);
-
-app.get("/benchmark", (_req, res) => {
-  const start = process.hrtime.bigint();
-
-  const data = benchmarkSamples.map((sample) => {
-    const speedup = Number((sample.baselineMs / sample.vectorizedMs).toFixed(2));
-    return {
-      ...sample,
-      speedup
-    };
-  });
-
-  const timingMs = Number(hrtimeToMs(start).toFixed(3));
-
-  res.json({
-    meta: {
-      timingMs,
-      queryCount: data.length
-    },
-    queryInspector: {
-      sql: "EXPLAIN ANALYZE <query-template>",
-      note: "Benchmark endpoint currently returns seeded timings"
-    },
-    data
-  });
-});
 
 app.use((req, res) => {
   res.status(404).json({

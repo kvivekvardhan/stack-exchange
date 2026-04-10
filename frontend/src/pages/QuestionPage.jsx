@@ -8,6 +8,7 @@ import {
   upvoteQuestion,
   upvoteReply
 } from "../api";
+import Modal from "../components/Modal";
 
 function formatDate(value) {
   const parsed = new Date(value);
@@ -21,6 +22,51 @@ function formatDate(value) {
     hour: "2-digit",
     minute: "2-digit"
   });
+}
+
+function updateAnswerScore(question, answerId, score) {
+  return {
+    ...question,
+    answers: question.answers.map((answer) =>
+      answer.id === answerId ? { ...answer, score } : answer
+    )
+  };
+}
+
+function appendAnswer(question, answer) {
+  return {
+    ...question,
+    answers: [...question.answers, answer]
+  };
+}
+
+function appendReplyToAnswer(question, answerId, reply) {
+  return {
+    ...question,
+    answers: question.answers.map((answer) => {
+      if (answer.id !== answerId) {
+        return answer;
+      }
+      return { ...answer, replies: [...(answer.replies || []), reply] };
+    })
+  };
+}
+
+function updateReplyScore(question, answerId, replyId, score) {
+  return {
+    ...question,
+    answers: question.answers.map((answer) => {
+      if (answer.id !== answerId) {
+        return answer;
+      }
+      return {
+        ...answer,
+        replies: (answer.replies || []).map((reply) =>
+          reply.id === replyId ? { ...reply, score } : reply
+        )
+      };
+    })
+  };
 }
 
 export default function QuestionPage() {
@@ -99,14 +145,7 @@ export default function QuestionPage() {
         author: answerAuthor,
         body: answerBody
       });
-      setQuestion((prev) =>
-        prev
-          ? {
-              ...prev,
-              answers: [...prev.answers, response.data]
-            }
-          : prev
-      );
+      setQuestion((prev) => (prev ? appendAnswer(prev, response.data) : prev));
       setAnswerAuthor("");
       setAnswerBody("");
       setAnswerModalOpen(false);
@@ -125,17 +164,7 @@ export default function QuestionPage() {
     setActionError("");
     try {
       const response = await upvoteAnswer(question.id, answerId);
-      setQuestion((prev) => {
-        if (!prev) {
-          return prev;
-        }
-        return {
-          ...prev,
-          answers: prev.answers.map((answer) =>
-            answer.id === answerId ? { ...answer, score: response.data.score } : answer
-          )
-        };
-      });
+      setQuestion((prev) => (prev ? updateAnswerScore(prev, answerId, response.data.score) : prev));
     } catch (requestError) {
       setActionError(requestError.message);
     } finally {
@@ -158,21 +187,9 @@ export default function QuestionPage() {
     setActionError("");
     try {
       const response = await postReply(question.id, replyModalAnswerId, { body, author });
-      setQuestion((prev) => {
-        if (!prev) {
-          return prev;
-        }
-        return {
-          ...prev,
-          answers: prev.answers.map((answer) => {
-            if (answer.id !== replyModalAnswerId) {
-              return answer;
-            }
-            const nextReplies = [...(answer.replies || []), response.data];
-            return { ...answer, replies: nextReplies };
-          })
-        };
-      });
+      setQuestion((prev) =>
+        prev ? appendReplyToAnswer(prev, replyModalAnswerId, response.data) : prev
+      );
       setReplyAuthor("");
       setReplyBody("");
       setReplyModalAnswerId(null);
@@ -191,25 +208,9 @@ export default function QuestionPage() {
     setActionError("");
     try {
       const response = await upvoteReply(question.id, answerId, replyId);
-      setQuestion((prev) => {
-        if (!prev) {
-          return prev;
-        }
-        return {
-          ...prev,
-          answers: prev.answers.map((answer) => {
-            if (answer.id !== answerId) {
-              return answer;
-            }
-            return {
-              ...answer,
-              replies: (answer.replies || []).map((reply) =>
-                reply.id === replyId ? { ...reply, score: response.data.score } : reply
-              )
-            };
-          })
-        };
-      });
+      setQuestion((prev) =>
+        prev ? updateReplyScore(prev, answerId, replyId, response.data.score) : prev
+      );
     } catch (requestError) {
       setActionError(requestError.message);
     } finally {
@@ -346,73 +347,55 @@ export default function QuestionPage() {
       </section>
 
       {answerModalOpen && (
-        <div className="modal-backdrop" onClick={() => !postingAnswer && setAnswerModalOpen(false)}>
-          <section className="modal-card" onClick={(event) => event.stopPropagation()}>
-            <header className="modal-header">
-              <h3>Post Your Answer</h3>
-              <button
-                type="button"
-                className="modal-close"
-                onClick={() => !postingAnswer && setAnswerModalOpen(false)}
-                disabled={postingAnswer}
-              >
-                Close
-              </button>
-            </header>
-            <form className="inline-form" onSubmit={handlePostAnswer}>
-              <input
-                type="text"
-                placeholder="Your name (optional)"
-                value={answerAuthor}
-                onChange={(event) => setAnswerAuthor(event.target.value)}
-              />
-              <textarea
-                placeholder="Write your answer..."
-                value={answerBody}
-                onChange={(event) => setAnswerBody(event.target.value)}
-                required
-              />
-              <button type="submit" disabled={postingAnswer}>
-                {postingAnswer ? "Posting..." : "Post Answer"}
-              </button>
-            </form>
-          </section>
-        </div>
+        <Modal
+          title="Post Your Answer"
+          onClose={() => setAnswerModalOpen(false)}
+          disableClose={postingAnswer}
+        >
+          <form className="inline-form" onSubmit={handlePostAnswer}>
+            <input
+              type="text"
+              placeholder="Your name (optional)"
+              value={answerAuthor}
+              onChange={(event) => setAnswerAuthor(event.target.value)}
+            />
+            <textarea
+              placeholder="Write your answer..."
+              value={answerBody}
+              onChange={(event) => setAnswerBody(event.target.value)}
+              required
+            />
+            <button type="submit" disabled={postingAnswer}>
+              {postingAnswer ? "Posting..." : "Post Answer"}
+            </button>
+          </form>
+        </Modal>
       )}
 
       {replyModalAnswerId !== null && replyTargetAnswer && (
-        <div className="modal-backdrop" onClick={() => !postingReply && setReplyModalAnswerId(null)}>
-          <section className="modal-card" onClick={(event) => event.stopPropagation()}>
-            <header className="modal-header">
-              <h3>Reply to {replyTargetAnswer.author}</h3>
-              <button
-                type="button"
-                className="modal-close"
-                onClick={() => !postingReply && setReplyModalAnswerId(null)}
-                disabled={postingReply}
-              >
-                Close
-              </button>
-            </header>
-            <form className="inline-form" onSubmit={handlePostReply}>
-              <input
-                type="text"
-                placeholder="Your name (optional)"
-                value={replyAuthor}
-                onChange={(event) => setReplyAuthor(event.target.value)}
-              />
-              <textarea
-                placeholder="Write your reply..."
-                value={replyBody}
-                onChange={(event) => setReplyBody(event.target.value)}
-                required
-              />
-              <button type="submit" disabled={postingReply}>
-                {postingReply ? "Posting..." : "Post Reply"}
-              </button>
-            </form>
-          </section>
-        </div>
+        <Modal
+          title={`Reply to ${replyTargetAnswer.author}`}
+          onClose={() => setReplyModalAnswerId(null)}
+          disableClose={postingReply}
+        >
+          <form className="inline-form" onSubmit={handlePostReply}>
+            <input
+              type="text"
+              placeholder="Your name (optional)"
+              value={replyAuthor}
+              onChange={(event) => setReplyAuthor(event.target.value)}
+            />
+            <textarea
+              placeholder="Write your reply..."
+              value={replyBody}
+              onChange={(event) => setReplyBody(event.target.value)}
+              required
+            />
+            <button type="submit" disabled={postingReply}>
+              {postingReply ? "Posting..." : "Post Reply"}
+            </button>
+          </form>
+        </Modal>
       )}
     </section>
   );

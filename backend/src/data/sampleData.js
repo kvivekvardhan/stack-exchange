@@ -354,24 +354,3 @@ export const tagCatalog = [
   { name: "css", description: "CSS styling, layout, and interaction" },
   { name: "javascript", description: "JavaScript language and browser behavior" }
 ];
-
-export const benchmarkSamples = [
-  {
-    id: "q-template-1",
-    label: "Top questions by tag and score",
-    baselineMs: 42.8,
-    vectorizedMs: 28.1
-  },
-  {
-    id: "q-template-2",
-    label: "Recent questions with answer counts",
-    baselineMs: 57.6,
-    vectorizedMs: 36.4
-  },
-  {
-    id: "q-template-3",
-    label: "Keyword search in title/body",
-    baselineMs: 63.9,
-    vectorizedMs: 41.2
-  }
-];

@@ -58,18 +58,24 @@ async function seedDb() {
         const description =
           catalogDescriptions.get(tagName) || `Community tag for ${tagName}`;
 
-        const tagResult = await client.query(
+        const insertedTagResult = await client.query(
           `
           INSERT INTO tags (name, description)
           VALUES ($1, $2)
-          ON CONFLICT (name) DO UPDATE
-            SET description = tags.description
+          ON CONFLICT (name) DO NOTHING
           RETURNING id
           `,
           [tagName, description]
         );
 
-        const tagId = tagResult.rows[0].id;
+        let tagId = insertedTagResult.rows[0]?.id;
+        if (!tagId) {
+          const existingTagResult = await client.query(
+            "SELECT id FROM tags WHERE name = $1",
+            [tagName]
+          );
+          tagId = existingTagResult.rows[0]?.id;
+        }
 
         await client.query(
           `
