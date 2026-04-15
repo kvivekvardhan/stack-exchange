@@ -1,0 +1,30 @@
+sudo service postgresql start
+sudo -u postgres psql
+
+1st terminal
+    touch src/backend/executor/nodeSeqscan.c
+    touch src/include/executor/tuptable.h
+    touch src/include/nodes/execnodes.h
+    touch src/backend/commands/explain.c
+    make install
+
+2nd terminal
+    pg_ctl -D ~/pgdata -l ~/pgdata/logfile -o "-p 5433" stop
+    pg_ctl -D ~/pgdata -l ~/pgdata/logfile -o "-p 5433" start
+    pg_ctl -D ~/pgdata -l ~/pgdata/logfile -o "-p 5433" restart
+    psql -p 5433 -d postgres -c "EXPLAIN SELECT * FROM taxi_trips WHERE trip_distance > 5;"
+    psql -p 5433 -d postgres -c "SELECT passenger_count, AVG(fare_amount), COUNT(*) FROM taxi_trips WHERE trip_distance > 5 GROUP BY passenger_count;"
+    tail -20 ~/pgdata/logfilepsql -p 5433 -d postgres -c "\timing on" -c "SELECT passenger_count, AVG(fare_amount), COUNT(*) FROM taxi_trips WHERE trip_distance > 5 GROUP BY passenger_count;"
+
+
+3rd terminal
+    pg_ctl -D ~/pgdata -l ~/pgdata/logfile -o "-p 5434" stop
+    pg_ctl -D ~/pgdata -l ~/pgdata/logfile -o "-p 5434" start
+    pg_ctl -D ~/pgdata -l ~/pgdata/logfile -o "-p 5434" restart
+    psql -p 5434 -d postgres -c "EXPLAIN SELECT * FROM taxi_trips WHERE trip_distance > 5;"
+    psql -p 5434 -d postgres -c "SELECT passenger_count, AVG(fare_amount), COUNT(*) FROM taxi_trips WHERE trip_distance > 5 GROUP BY passenger_count;"
+    tail -20 ~/pgdata/logfile
+
+
+    psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -c "EXPLAIN SELECT * FROM taxi_trips WHERE trip_distance > 5;"
+    psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -c "\timing on" -c "SELECT passenger_count, AVG(fare_amount), COUNT(*) FROM taxi_trips WHERE trip_distance > 5 GROUP BY passenger_count;"
