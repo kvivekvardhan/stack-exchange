@@ -139,12 +139,12 @@ ExecInitSeqScan(SeqScan *node, EState *estate, int eflags)
 	scanstate->ss.ps.state = estate;
 	scanstate->ss.ps.ExecProcNode = ExecSeqScan;
 
-	// /* VECTORIZED: initialize batch tracking */
-	// scanstate->batch_count = 0;
-	// scanstate->batch_index = 0;
-	// scanstate->batch_done = false;
-	// scanstate->batch_tuples = NULL;
-	// scanstate->total_rows = 0;
+	/* VECTORIZED: initialize batch tracking */
+	scanstate->ss.vec_batch_count = 0;
+	scanstate->ss.vec_batch_index = 0;
+	scanstate->ss.vec_batch_done = false;
+	scanstate->ss.vec_batch_tuples = NULL;
+	scanstate->ss.vec_total_rows = 0;
 
 	/*
 	 * Miscellaneous initialization

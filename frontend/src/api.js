@@ -36,7 +36,8 @@ async function request(path, params = {}, options = {}) {
   const response = await fetch(buildUrl(path, withClientParams(params)), {
     method: options.method || "GET",
     headers,
-    body: options.body ? JSON.stringify(options.body) : undefined
+    body: options.body ? JSON.stringify(options.body) : undefined,
+    signal: options.signal
   });
   const payload = await response.json();
 

@@ -1485,6 +1485,13 @@ typedef struct ScanState
     int64      *vec_agg_count;      /* count(*) per group */
     bool        vec_agg_enabled;    /* enable aggregate tracking */
     bool        vec_agg_logged;     /* aggregate results logged */
+
+    /* VECTORIZED: batch tracking */
+    int         vec_batch_count;
+    int         vec_batch_index;
+    bool        vec_batch_done;
+    HeapTuple  *vec_batch_tuples;
+    int64       vec_total_rows;
 } ScanState;
 
 /* ----------------

@@ -9,10 +9,10 @@ OUT_DIR=${OUT_DIR:-/home/vivekvardhank/ACADS/DBIS/stack-exchange/postgres/benchm
 OUT_FILE=${OUT_FILE:-$OUT_DIR/results.md}
 
 queries=(
-  "SELECT AVG(fare_amount) FROM taxi_trips WHERE trip_distance > 5;"
-  "SELECT passenger_count, AVG(fare_amount), COUNT(*) FROM taxi_trips WHERE trip_distance > 5 GROUP BY passenger_count;"
-  "SELECT passenger_count, AVG(fare_amount) FROM taxi_trips WHERE trip_distance BETWEEN 2 AND 8 GROUP BY passenger_count;"
-  "SELECT passenger_count, COUNT(*) FROM taxi_trips GROUP BY passenger_count;"
+  "SELECT COUNT(*) FROM se_posts WHERE ViewCount > 100;"
+  "SELECT PostTypeId, AVG(Score) FROM se_posts WHERE ViewCount > 100 GROUP BY PostTypeId;"
+  "SELECT PostTypeId, AVG(Score), COUNT(*) FROM se_posts WHERE ViewCount > 500 GROUP BY PostTypeId;"
+  "SELECT AVG(Score) FROM se_posts WHERE ViewCount > 1000;"
 )
 
 function run_query() {
@@ -52,7 +52,7 @@ PY
 )
     fi
 
-    echo "| \\$ ${sql} \\$$ | $base_time | $vec_time | $speedup |"
+    echo "| \`$sql\` | $base_time | $vec_time | $speedup |"
   done
 } > "$OUT_FILE"
 
