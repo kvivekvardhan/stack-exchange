@@ -9,7 +9,7 @@ export default function HomePage() {
       <QuestionFeed
         title="Top Questions"
         subtitle="Search and browse the top-scoring community questions."
-        previewLimit={4}
+        previewLimit={10}
       />
     </section>
   );

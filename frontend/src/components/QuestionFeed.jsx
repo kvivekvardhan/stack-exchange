@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useRef } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { searchQuestions } from "../api";
 import QueryInspector from "./QueryInspector";
@@ -75,6 +75,15 @@ export default function QuestionFeed({
   const [error, setError] = useState("");
   const [results, setResults] = useState([]);
   const [meta, setMeta] = useState(null);
+  const [offset, setOffset] = useState(0);
+  const [hasMore, setHasMore] = useState(true);
+  const loadMoreRef = useRef(null);
+
+  useEffect(() => {
+    setOffset(0);
+    setResults([]);
+    setHasMore(true);
+  }, [urlQ, urlTag, activeSort]);
 
   useEffect(() => {
     setSearchInput(urlQ);
@@ -89,16 +98,26 @@ export default function QuestionFeed({
     const controller = new AbortController();
 
     async function fetchResults() {
-      setLoading(true);
+      if (offset === 0) setLoading(true);
       setError("");
 
       try {
+        const limit = previewLimit || 25;
         const response = await searchQuestions(
-          { q: urlQ.trim(), tag: urlTag.trim() },
+          { q: urlQ.trim(), tag: urlTag.trim(), sort: activeSort, limit, offset },
           { signal: controller.signal }
         );
         if (active) {
-          setResults(response.data);
+          if (offset === 0) {
+            setResults(response.data);
+          } else {
+            setResults(prev => {
+              const existingIds = new Set(prev.map(p => p.id));
+              const newItems = response.data.filter(p => !existingIds.has(p.id));
+              return [...prev, ...newItems];
+            });
+          }
+          setHasMore(response.data.length === limit);
           setMeta(response.meta || null);
         }
       } catch (requestError) {
@@ -107,7 +126,7 @@ export default function QuestionFeed({
         }
         if (active) {
           setError(requestError.message);
-          setResults([]);
+          if (offset === 0) setResults([]);
           setMeta(null);
         }
       } finally {
@@ -123,7 +142,18 @@ export default function QuestionFeed({
       active = false;
       controller.abort();
     };
-  }, [urlQ, urlTag]);
+  }, [urlQ, urlTag, activeSort, offset, previewLimit]);
+
+  useEffect(() => {
+    if (!hasMore || loading || previewLimit) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries[0].isIntersecting) {
+        setOffset((prev) => prev + 25);
+      }
+    });
+    if (loadMoreRef.current) observer.observe(loadMoreRef.current);
+    return () => observer.disconnect();
+  }, [hasMore, loading, previewLimit]);
 
   function handleSubmit(event) {
     event.preventDefault();
@@ -154,11 +184,8 @@ export default function QuestionFeed({
   }
 
   const sortedResults = useMemo(() => {
-    if (!enableSorting) {
-      return results;
-    }
-    return sortQuestions(results, activeSort);
-  }, [enableSorting, results, activeSort]);
+    return results; // Backend handles sorting dynamically now
+  }, [results]);
 
   const visibleResults = useMemo(() => {
     const source = sortedResults;
@@ -256,11 +283,17 @@ export default function QuestionFeed({
         ))}
       </div>
 
+      {!previewLimit && hasMore && (
+        <div ref={loadMoreRef} className="load-more-trigger" style={{ padding: "20px 0", textAlign: "center" }}>
+          {loading && offset > 0 && <span className="status loading">Loading more questions...</span>}
+        </div>
+      )}
+
       {!loading && !error && visibleResults.length === 0 && (
         <p className="status empty">No questions found for this search.</p>
       )}
 
-      {previewLimit && sortedResults.length > previewLimit && (
+      {previewLimit && sortedResults.length > 0 && (
         <p className="preview-link-wrap">
           <Link to={viewAllLink}>
             View all questions

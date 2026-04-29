@@ -299,7 +299,7 @@ export default function QuestionPage() {
 
       <article className="detail-card">
         <h2>{question.title}</h2>
-        <p className="detail-body">{question.body}</p>
+        <div className="detail-body" dangerouslySetInnerHTML={{ __html: question.body }} />
         <div className="tag-row">
           {question.tags.map((tag) => (
             <span key={tag} className="tag-chip">
@@ -332,7 +332,7 @@ export default function QuestionPage() {
         <div className="answer-list">
           {question.answers.map((answer) => (
             <article key={answer.id} className="answer-card">
-              <p>{answer.body}</p>
+              <div className="answer-body" dangerouslySetInnerHTML={{ __html: answer.body }} />
               <p className="question-date">
                 by {answer.ownerDisplayName || "anonymous"} • {formatDate(answer.creationDate)}
               </p>
@@ -364,7 +364,7 @@ export default function QuestionPage() {
               <div className="reply-list">
                 {(answer.comments || []).map((comment) => (
                   <article key={comment.id} className="reply-card">
-                    <p>{comment.text}</p>
+                    <div className="comment-body" dangerouslySetInnerHTML={{ __html: comment.text }} />
                     <p className="question-date">
                       by {comment.userDisplayName || "anonymous"} • {formatDate(comment.creationDate)}
                     </p>

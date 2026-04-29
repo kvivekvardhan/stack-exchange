@@ -49,8 +49,8 @@ async function request(path, params = {}, options = {}) {
   return payload;
 }
 
-export function searchQuestions({ q, tag }, options = {}) {
-  return request("/search", { q, tag }, options);
+export function searchQuestions({ q, tag, sort, limit, offset }, options = {}) {
+  return request("/search", { q, tag, sort, limit, offset }, options);
 }
 
 export function getTags({ q } = {}, options = {}) {

@@ -576,9 +576,32 @@ a {
   margin: 0;
 }
 
-.detail-body {
+.detail-body, .answer-body, .comment-body {
   margin: 0.75rem 0 0.3rem;
   line-height: 1.45;
+  width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.detail-body *, .answer-body *, .comment-body * {
+  max-width: 100%;
+}
+
+.detail-body pre, .answer-body pre, .comment-body pre {
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  word-break: break-all;
+  overflow-x: auto;
+  background-color: #f6f6f6;
+  padding: 10px;
+  border-radius: 4px;
+}
+
+.detail-body code, .answer-body code, .comment-body code {
+  word-break: break-all;
+  overflow-wrap: anywhere;
 }
 
 .action-row {

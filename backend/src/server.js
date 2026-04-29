@@ -150,19 +150,8 @@ function parsePostTags(rawTags) {
     return [];
   }
 
-  const tags = [];
-  const matcher = /<([^>]+)>/g;
-  let match;
-  while ((match = matcher.exec(raw))) {
-    tags.push(match[1]);
-  }
-
-  if (tags.length > 0) {
-    return tags;
-  }
-
   return raw
-    .split(",")
+    .split(/[<>\|,]+/)
     .map((tag) => tag.trim().toLowerCase())
     .filter(Boolean);
 }
@@ -172,7 +161,7 @@ function formatTagFilter(rawTag) {
   if (!tag) {
     return "";
   }
-  return `<${tag}>`;
+  return tag;
 }
 
 function mapSearchQuestion(row) {
@@ -399,6 +388,17 @@ app.get(
     const minViews =
       Number.isFinite(minViewsParsed) && minViewsParsed >= 0 ? minViewsParsed : 0;
 
+    const limit = parseInt(req.query.limit, 10) || 25;
+    const offset = parseInt(req.query.offset, 10) || 0;
+    const sort = String(req.query.sort || "upvotes_desc");
+
+    let orderClause = "ORDER BY p.score DESC, p.creationdate DESC";
+    if (sort === "upvotes_asc") orderClause = "ORDER BY p.score ASC, p.creationdate ASC";
+    else if (sort === "views_desc") orderClause = "ORDER BY p.viewcount DESC NULLS LAST, p.creationdate DESC";
+    else if (sort === "views_asc") orderClause = "ORDER BY COALESCE(p.viewcount, 0) ASC, p.creationdate ASC";
+    else if (sort === "time_desc") orderClause = "ORDER BY p.creationdate DESC, p.id DESC";
+    else if (sort === "time_asc") orderClause = "ORDER BY p.creationdate ASC, p.id ASC";
+
     const searchSql = `
       SELECT
         p.id,
@@ -413,12 +413,12 @@ app.get(
       FROM posts p
       WHERE p.posttypeid = 1
         AND ($1 = '' OR LOWER(COALESCE(p.title, '') || ' ' || p.body) LIKE '%' || $1 || '%')
-        AND ($2 = '' OR p.tags ILIKE '%' || $2 || '%')
-        AND p.viewcount >= $3
-      ORDER BY p.score DESC, p.creationdate DESC
-      LIMIT 100
+        AND ($2 = '' OR p.tags ILIKE '%<' || $2 || '>%' OR p.tags ILIKE '%|' || $2 || '|%')
+        AND COALESCE(p.viewcount, 0) >= $3
+      ${orderClause}
+      LIMIT $4 OFFSET $5
     `;
-    const searchResult = await runQuery(engine, searchSql, [q, tagFilter, minViews], { inspect });
+    const searchResult = await runQuery(engine, searchSql, [q, tagFilter, minViews, limit, offset], { inspect });
 
     const responseRows = searchResult.result.rows.map(mapSearchQuestion);
     const timingMs = searchResult.timingMs;
@@ -427,14 +427,14 @@ app.get(
       meta: {
         timingMs,
         resultCount: responseRows.length,
-        query: { q, tag, minViews },
+        query: { q, tag, minViews, sort, limit, offset },
         engine,
         inspector: inspect
           ? [
               {
                 name: "search",
                 sql: searchSql.trim(),
-                params: [q, tagFilter, minViews],
+                params: [q, tagFilter, minViews, limit, offset],
                 plan: searchResult.plan
               }
             ]
@@ -894,8 +894,8 @@ app.get(
   "/benchmark",
   asyncHandler(async (req, res) => {
     const inspect = isInspectorEnabled(req);
-    const searchTerm = String(req.query.q || "postgres").trim().toLowerCase();
-    const tagTerm = String(req.query.tag || "sql").trim().toLowerCase();
+    const searchTerm = String(req.query.q || "").trim().toLowerCase();
+    const tagTerm = String(req.query.tag || "").trim().toLowerCase();
     const tagFilter = formatTagFilter(tagTerm);
 
     const queries = [
@@ -917,7 +917,7 @@ app.get(
           SELECT p.id
           FROM posts p
           WHERE p.posttypeid = 1
-            AND ($1 = '' OR p.tags ILIKE '%' || $1 || '%')
+            AND ($1 = '' OR p.tags ILIKE '%<' || $1 || '>%' OR p.tags ILIKE '%|' || $1 || '|%')
           ORDER BY p.score DESC, p.creationdate DESC
           LIMIT 25
         `,

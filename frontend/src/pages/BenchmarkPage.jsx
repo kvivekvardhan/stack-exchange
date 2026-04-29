@@ -3,8 +3,8 @@ import { getBenchmark } from "../api";
 import QueryInspector from "../components/QueryInspector";
 
 export default function BenchmarkPage() {
-  const [search, setSearch] = useState("postgres");
-  const [tag, setTag] = useState("sql");
+  const [search, setSearch] = useState("");
+  const [tag, setTag] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [benchmark, setBenchmark] = useState(null);
@@ -45,7 +45,6 @@ export default function BenchmarkPage() {
   }
 
   useEffect(() => {
-    fetchBenchmark({ q: search, tag });
     return () => {
       if (abortRef.current) {
         abortRef.current.abort();
@@ -55,6 +54,10 @@ export default function BenchmarkPage() {
 
   function handleSubmit(event) {
     event.preventDefault();
+    if (!search.trim() && !tag.trim()) {
+      setError("Please enter a search term or a tag filter to run the benchmark.");
+      return;
+    }
     fetchBenchmark({ q: search, tag });
   }
 
