@@ -1478,11 +1478,12 @@ typedef struct ScanState
     int64       vec_total_passed;   /* total tuples passed across scan */
     int64       vec_total_filtered; /* total tuples filtered across scan */
 
-    /* VECTORIZED: aggregate state (PostTypeId groups for se_posts) */
-    float8     *vec_agg_sum;        /* sum(score) per group */
-    float8     *vec_agg_sum2;       /* reserved for future aggregates */
-    float8     *vec_agg_dist_sum;   /* reserved for future aggregates */
+    /* VECTORIZED: aggregate state (dynamic groups for se_posts) */
+    int32      *vec_agg_keys;       /* group key values (PostTypeId) */
+    int64      *vec_agg_sum_i64;    /* exact sum(score) per group */
     int64      *vec_agg_count;      /* count(*) per group */
+    int         vec_agg_ngroups;    /* number of active groups */
+    int         vec_agg_cap;        /* allocated capacity of arrays */
     bool        vec_agg_enabled;    /* enable aggregate tracking */
     bool        vec_agg_logged;     /* aggregate results logged */
 
@@ -2472,7 +2473,7 @@ typedef struct AggState
 	/* VECTORIZED: aggregate passthrough state */
 	bool		vec_agg_enabled;	/* using vectorized aggregate output */
 	bool		vec_agg_drained;	/* outer scan fully drained */
-	int		vec_agg_emit_index; /* next passenger_count to emit */
+	int		vec_agg_emit_index; /* next dynamic aggregate-group index */
 } AggState;
 
 /* ----------------

@@ -175,12 +175,12 @@ typedef enum VecRelationKind
 } VecRelationKind;
 
 /* VECTORIZED: column positions for se_posts schema */
-#define VEC_AGG_MAX_GROUPS  8
 #define VEC_COL_POSTTYPE      2   /* PostTypeId */
 #define VEC_COL_SCORE         3   /* Score */
 #define VEC_COL_VIEWCOUNT     4   /* ViewCount */
 
 #define VEC_BATCH_SIZE      1000
+#define VEC_AGG_INIT_CAP      16
 
 /* VECTORIZED: detect exact se_posts schema */
 static bool
@@ -267,15 +267,37 @@ vec_detect_target_relation(ScanState *node)
 static inline void
 vec_agg_reset(ScanState *node)
 {
-    if (node->vec_agg_sum)
-        memset(node->vec_agg_sum, 0, VEC_AGG_MAX_GROUPS * sizeof(float8));
-    if (node->vec_agg_sum2)
-        memset(node->vec_agg_sum2, 0, VEC_AGG_MAX_GROUPS * sizeof(float8));
-    if (node->vec_agg_dist_sum)
-        memset(node->vec_agg_dist_sum, 0, VEC_AGG_MAX_GROUPS * sizeof(float8));
-    if (node->vec_agg_count)
-        memset(node->vec_agg_count, 0, VEC_AGG_MAX_GROUPS * sizeof(int64));
+    node->vec_agg_ngroups = 0;
     node->vec_agg_logged = false;
+}
+
+static int
+vec_agg_find_or_add_group(ScanState *node, int32 key)
+{
+    int i;
+
+    for (i = 0; i < node->vec_agg_ngroups; i++)
+    {
+        if (node->vec_agg_keys[i] == key)
+            return i;
+    }
+
+    if (node->vec_agg_ngroups >= node->vec_agg_cap)
+    {
+        int newcap = (node->vec_agg_cap <= 0) ? VEC_AGG_INIT_CAP : node->vec_agg_cap * 2;
+        node->vec_agg_keys = (int32 *) repalloc(node->vec_agg_keys, newcap * sizeof(int32));
+        node->vec_agg_sum_i64 = (int64 *) repalloc(node->vec_agg_sum_i64, newcap * sizeof(int64));
+        node->vec_agg_count = (int64 *) repalloc(node->vec_agg_count, newcap * sizeof(int64));
+        memset(node->vec_agg_sum_i64 + node->vec_agg_cap, 0, (newcap - node->vec_agg_cap) * sizeof(int64));
+        memset(node->vec_agg_count + node->vec_agg_cap, 0, (newcap - node->vec_agg_cap) * sizeof(int64));
+        node->vec_agg_cap = newcap;
+    }
+
+    i = node->vec_agg_ngroups++;
+    node->vec_agg_keys[i] = key;
+    node->vec_agg_sum_i64[i] = 0;
+    node->vec_agg_count[i] = 0;
+    return i;
 }
 
 TupleTableSlot *
@@ -306,8 +328,11 @@ ExecScan(ScanState *node,
         {
             if (relkind == VEC_REL_SE_POSTS)
             {
-                node->vec_agg_sum = (float8 *) palloc0(VEC_AGG_MAX_GROUPS * sizeof(float8));
-                node->vec_agg_count = (int64 *) palloc0(VEC_AGG_MAX_GROUPS * sizeof(int64));
+                node->vec_agg_keys = (int32 *) palloc(VEC_AGG_INIT_CAP * sizeof(int32));
+                node->vec_agg_sum_i64 = (int64 *) palloc0(VEC_AGG_INIT_CAP * sizeof(int64));
+                node->vec_agg_count = (int64 *) palloc0(VEC_AGG_INIT_CAP * sizeof(int64));
+                node->vec_agg_ngroups = 0;
+                node->vec_agg_cap = VEC_AGG_INIT_CAP;
                 node->vec_agg_enabled = true;
             }
             else
@@ -412,12 +437,14 @@ ExecScan(ScanState *node,
                                                node->ss_ScanTupleSlot->tts_tupleDescriptor, &isnull);
                         int32 type_id = isnull ? 0 : DatumGetInt32(d);
 
-                        if (type_id > 0 && type_id < VEC_AGG_MAX_GROUPS)
+                        if (!isnull)
                         {
+                            int gidx = vec_agg_find_or_add_group(node, type_id);
                             Datum score_d = heap_getattr(tup, VEC_COL_SCORE,
                                                          node->ss_ScanTupleSlot->tts_tupleDescriptor, &isnull);
-                            node->vec_agg_sum[type_id] += isnull ? 0 : DatumGetInt32(score_d);
-                            node->vec_agg_count[type_id]++;
+                            if (!isnull)
+                                node->vec_agg_sum_i64[gidx] += (int64) DatumGetInt32(score_d);
+                            node->vec_agg_count[gidx]++;
                         }
                     }
                 }
@@ -444,11 +471,13 @@ ExecScan(ScanState *node,
                 if (node->vec_agg_enabled && !node->vec_agg_logged)
                 {
                     int i;
-                    for (i = 1; i < VEC_AGG_MAX_GROUPS; i++)
+                    for (i = 0; i < node->vec_agg_ngroups; i++)
                     {
                         if (node->vec_agg_count[i] == 0) continue;
                         elog(LOG, "VECTORIZED AGG: PostType=%d avg_score=%.4f count=" INT64_FORMAT,
-                             i, node->vec_agg_sum[i] / (double) node->vec_agg_count[i], node->vec_agg_count[i]);
+                             node->vec_agg_keys[i],
+                             (double) node->vec_agg_sum_i64[i] / (double) node->vec_agg_count[i],
+                             node->vec_agg_count[i]);
                     }
                     elog(LOG, "VECTORIZED SCAN TOTAL: " INT64_FORMAT " passed, " INT64_FORMAT " filtered",
                          node->vec_total_passed, node->vec_total_filtered);

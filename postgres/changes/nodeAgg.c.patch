@@ -2,7 +2,7 @@ diff --git a/src/backend/executor/nodeAgg.c b/src/backend/executor/nodeAgg.c
 index 2d9f37d..8e2f4a1 100644
 --- a/src/backend/executor/nodeAgg.c
 +++ b/src/backend/executor/nodeAgg.c
-@@ -72,6 +72,7 @@
+@@ -72,6 +72,8 @@
  #include "postgres.h"
  
  #include "access/htup_details.h"
@@ -10,10 +10,63 @@ index 2d9f37d..8e2f4a1 100644
  #include "executor/execdebug.h"
  #include "executor/executor.h"
  #include "executor/nodeAgg.h"
-@@ -317,6 +318,65 @@ static void hashagg_spill_finish(AggState *aggstate, HashAggSpill *spill,
++#include "utils/lsyscache.h"
+@@ -317,6 +318,144 @@ static void hashagg_spill_finish(AggState *aggstate, HashAggSpill *spill,
  							 int setno, int setoff, int *numGroups);
  static void initialize_phase(AggState *aggstate, int newphase);
  
++/*
++ * VECTORIZED: verify aggregate identities/shapes:
++ *   AVG(score::int4), COUNT(*)
++ */
++static bool
++ExecVecAggMatchesAggrefs(AggState *aggstate)
++{
++	ListCell   *lc;
++	bool		seen_avg = false;
++	bool		seen_count = false;
++
++	foreach(lc, aggstate->aggs)
++	{
++		Aggref	   *aggref = lfirst_node(Aggref, lc);
++		TargetEntry *tle;
++		Var		   *v;
++		char	   *aggname;
++
++		if (aggref == NULL || !OidIsValid(aggref->aggfnoid))
++			return false;
++		if (aggref->aggdistinct != NIL || aggref->aggorder != NIL || aggref->aggfilter != NULL)
++			return false;
++		aggname = get_func_name(aggref->aggfnoid);
++		if (aggname == NULL)
++			return false;
++
++		if (aggref->aggstar)
++		{
++			if (strcmp(aggname, "count") != 0 ||
++				aggref->aggtype != INT8OID || seen_count)
++				return false;
++			seen_count = true;
++			continue;
++		}
++
++		if (list_length(aggref->args) != 1)
++			return false;
++		tle = lfirst_node(TargetEntry, aggref->args);
++		if (tle == NULL || tle->expr == NULL || !IsA(tle->expr, Var))
++			return false;
++		v = castNode(Var, tle->expr);
++		if (v->varattno != 3 || v->vartype != INT4OID)
++			return false;
++		if (strcmp(aggname, "avg") != 0 ||
++			aggref->aggtype != NUMERICOID || seen_avg)
++			return false;
++		seen_avg = true;
++	}
++
++	return seen_avg && seen_count;
++}
++
 +/*
 + * VECTORIZED: emit aggregate rows directly from ScanState side-channel arrays.
 + *
@@ -25,7 +78,7 @@ index 2d9f37d..8e2f4a1 100644
 +{
 +	PlanState	  *outer;
 +	ScanState	  *scan;
-+	ExprContext   *econtext;
++	TupleTableSlot *result;
 +	int			   g;
 +
 +	outer = outerPlanState(aggstate);
@@ -33,44 +86,69 @@ index 2d9f37d..8e2f4a1 100644
 +		return NULL;
 +
 +	scan = (ScanState *) outer;
-+	econtext = aggstate->ss.ps.ps_ExprContext;
++
++	/*
++	 * Safety guards:
++	 * - only simple, non-split agg (no partial/final parallel state)
++	 * - only plain/sorted strategy (not hash/mixed)
++	 * - require scan-side arrays and expected output shape (3 cols)
++	 */
++	if (!scan->vec_active || !scan->vec_agg_enabled ||
++		scan->vec_agg_keys == NULL ||
++		scan->vec_agg_sum_i64 == NULL ||
++		scan->vec_agg_count == NULL ||
++		aggstate->aggsplit != AGGSPLIT_SIMPLE ||
++		(aggstate->aggstrategy != AGG_PLAIN &&
++		 aggstate->aggstrategy != AGG_SORTED) ||
++		aggstate->ss.ss_ScanTupleSlot->tts_tupleDescriptor == NULL ||
++		aggstate->ss.ss_ScanTupleSlot->tts_tupleDescriptor->natts != 3 ||
++		aggstate->ss.ps.qual != NULL ||
++		!ExecVecAggMatchesAggrefs(aggstate))
++		return NULL;
 +
 +	/* Drain the outer scan once so vector side-channel stats are finalized. */
 +	if (!aggstate->vec_agg_drained)
 +	{
 +		while (ExecProcNode(outer) != NULL)
-+			;
++			CHECK_FOR_INTERRUPTS();
 +		aggstate->vec_agg_drained = true;
-+		aggstate->vec_agg_emit_index = 1;
++		aggstate->vec_agg_emit_index = 0;
 +	}
 +
 +	for (;;)
 +	{
-+		if (aggstate->vec_agg_emit_index >= 8)
++		if (aggstate->vec_agg_emit_index >= scan->vec_agg_ngroups)
++		{
++			aggstate->agg_done = true;
 +			return NULL;
++		}
 +
 +		g = aggstate->vec_agg_emit_index++;
 +		if (scan->vec_agg_count[g] == 0)
 +			continue;
 +
-+		/*
-+		 * Fill precomputed aggregate values for projection targetlist:
-+		 *   Agg value 1: AVG(score)
-+		 *   Agg value 2: COUNT(*)
-+		 */
-+		econtext->ecxt_aggvalues[0] = Float8GetDatum(
-+			scan->vec_agg_sum[g] / (double) scan->vec_agg_count[g]);
-+		econtext->ecxt_aggnulls[0] = false;
++		/* Build output tuple directly to avoid slot/index/projection mismatch. */
++		result = aggstate->ss.ss_ScanTupleSlot;
++		ExecClearTuple(result);
 +
-+		econtext->ecxt_aggvalues[1] = Int64GetDatum(scan->vec_agg_count[g]);
-+		econtext->ecxt_aggnulls[1] = false;
++		/* GROUP BY key: PostTypeId */
++		result->tts_values[0] = Int32GetDatum(scan->vec_agg_keys[g]);
++		result->tts_isnull[0] = false;
 +
-+		/* Group key value visible to projection. */
-+		econtext->ecxt_outertuple->tts_values[1] = Int32GetDatum(g);
-+		econtext->ecxt_outertuple->tts_isnull[1] = false;
-+		ExecStoreVirtualTuple(econtext->ecxt_outertuple);
++		/* AVG(score): exact numeric(sum_i64) / numeric(count_i64). */
++		{
++			Datum avg_sum_numeric = DirectFunctionCall1(int8_numeric, Int64GetDatum(scan->vec_agg_sum_i64[g]));
++			Datum avg_count_numeric = DirectFunctionCall1(int8_numeric, Int64GetDatum(scan->vec_agg_count[g]));
++			result->tts_values[1] = DirectFunctionCall2(numeric_div, avg_sum_numeric, avg_count_numeric);
++		}
++		result->tts_isnull[1] = false;
 +
-+		return ExecProject(aggstate->ss.ps.ps_ProjInfo);
++		/* COUNT(*) */
++		result->tts_values[2] = Int64GetDatum(scan->vec_agg_count[g]);
++		result->tts_isnull[2] = false;
++
++		ExecStoreVirtualTuple(result);
++		return result;
 +	}
 +}
 +
@@ -78,7 +156,7 @@ index 2d9f37d..8e2f4a1 100644
  /* ----------------------------------------------------------------
   *      ExecAgg
   *
-@@ -333,6 +393,22 @@ ExecAgg(PlanState *pstate)
+@@ -333,6 +393,40 @@ ExecAgg(PlanState *pstate)
  {
  	AggState   *node = castNode(AggState, pstate);
  
@@ -88,12 +166,29 @@ index 2d9f37d..8e2f4a1 100644
 +	if (!node->vec_agg_enabled)
 +	{
 +		PlanState *outer = outerPlanState(node);
++		Agg *aggnode = castNode(Agg, node->ss.ps.plan);
 +		if (outer && IsA(outer, ScanState))
 +		{
 +			ScanState *scan = (ScanState *) outer;
-+			node->vec_agg_enabled = scan->vec_active && scan->vec_agg_enabled;
++			node->vec_agg_enabled =
++				scan->vec_active &&
++				scan->vec_agg_enabled &&
++				scan->vec_agg_keys != NULL &&
++				scan->vec_agg_sum_i64 != NULL &&
++				scan->vec_agg_count != NULL &&
++				node->aggsplit == AGGSPLIT_SIMPLE &&
++				(node->aggstrategy == AGG_PLAIN ||
++				 node->aggstrategy == AGG_SORTED) &&
++				aggnode != NULL &&
++				aggnode->numCols == 1 &&
++				aggnode->grpColIdx != NULL &&
++				aggnode->grpColIdx[0] == 2 &&
++				aggnode->groupingSets == NIL &&
++				node->numaggs == 2 &&
++				node->ss.ps.qual == NULL &&
++				ExecVecAggMatchesAggrefs(node);
 +			node->vec_agg_drained = false;
-+			node->vec_agg_emit_index = 1;
++			node->vec_agg_emit_index = 0;
 +		}
 +	}
 +	if (node->vec_agg_enabled)
@@ -110,7 +205,7 @@ index 2d9f37d..8e2f4a1 100644
 +	/* VECTORIZED aggregate passthrough state */
 +	aggstate->vec_agg_enabled = false;
 +	aggstate->vec_agg_drained = false;
-+	aggstate->vec_agg_emit_index = 1;
++	aggstate->vec_agg_emit_index = 0;
  
  	aggstate->current_phase = 0;
  	aggstate->phase = NULL;
