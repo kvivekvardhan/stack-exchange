@@ -87,9 +87,8 @@ export default function TagsPage() {
               <h3>
                 <Link to={`/questions?tag=${encodeURIComponent(tag.name)}`}>{tag.name}</Link>
               </h3>
-              <p className="tag-description">{tag.description}</p>
+              <p className="tag-description">Used in {tag.questionCount} posts</p>
             </div>
-            <p className="tag-count">{tag.questionCount} questions</p>
           </article>
         ))}
       </div>

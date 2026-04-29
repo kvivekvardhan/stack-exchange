@@ -1,121 +1,190 @@
-import { questions, tagCatalog } from "../data/sampleData.js";
+import { questions } from "../data/sampleData.js";
 import { closePool, withTransaction } from "./pool.js";
 
-function cleanAuthor(value) {
+function cleanDisplayName(value) {
   return String(value || "anonymous").trim() || "anonymous";
 }
 
+function normalizeTags(rawTags) {
+  const tags = Array.isArray(rawTags)
+    ? rawTags
+    : String(rawTags || "")
+        .split(",")
+        .map((tag) => tag.trim().toLowerCase())
+        .filter(Boolean);
+  return [...new Set(tags)].slice(0, 5);
+}
+
+function formatPostTags(tags) {
+  if (!tags || tags.length === 0) {
+    return null;
+  }
+  return tags.map((tag) => `<${tag}>`).join("");
+}
+
+function collectUsernames() {
+  const names = new Set();
+  questions.forEach((question) => {
+    names.add(cleanDisplayName(question.askedBy));
+    (question.answers || []).forEach((answer) => {
+      names.add(cleanDisplayName(answer.author));
+      (answer.replies || []).forEach((reply) => {
+        names.add(cleanDisplayName(reply.author));
+      });
+    });
+  });
+  return [...names];
+}
+
 async function seedDb() {
-  const catalogDescriptions = new Map(
-    tagCatalog.map((item) => [item.name.toLowerCase(), item.description || "No description available"])
-  );
+  const usernames = collectUsernames();
+  const userIdByName = new Map();
+  const users = usernames.map((name, index) => {
+    const id = 1000 + index + 1;
+    userIdByName.set(name, id);
+    return {
+      id,
+      displayName: name,
+      reputation: 100 + index * 5
+    };
+  });
+
+  const tagCounts = new Map();
+  questions.forEach((question) => {
+    const tags = normalizeTags(question.tags);
+    tags.forEach((tag) => {
+      tagCounts.set(tag, (tagCounts.get(tag) || 0) + 1);
+    });
+  });
 
   await withTransaction(async (client) => {
     await client.query(
-      "TRUNCATE question_tags, replies, answers, questions, tags RESTART IDENTITY CASCADE"
+      "TRUNCATE comments, votes, posts, tags, users RESTART IDENTITY CASCADE"
     );
 
-    for (const catalogItem of tagCatalog) {
-      const tagName = String(catalogItem.name || "").trim().toLowerCase();
-      if (!tagName) {
-        continue;
-      }
-
+    for (const user of users) {
       await client.query(
         `
-        INSERT INTO tags (name, description)
-        VALUES ($1, $2)
-        ON CONFLICT (name) DO UPDATE
-          SET description = EXCLUDED.description
+        INSERT INTO users (id, display_name, reputation, creation_date, last_access_date, views, upvotes, downvotes)
+        VALUES ($1, $2, $3, NOW(), NOW(), 0, 0, 0)
         `,
-        [tagName, catalogItem.description || "No description available"]
+        [user.id, user.displayName, user.reputation]
+      );
+    }
+
+    for (const [tagName, count] of tagCounts.entries()) {
+      await client.query(
+        `
+        INSERT INTO tags (tag_name, count, is_moderator_only, is_required)
+        VALUES ($1, $2, false, false)
+        ON CONFLICT (tag_name) DO UPDATE SET count = EXCLUDED.count
+        `,
+        [tagName, count]
       );
     }
 
     for (const question of questions) {
+      const questionTags = normalizeTags(question.tags);
+      const ownerDisplayName = cleanDisplayName(question.askedBy);
+      const ownerUserId = userIdByName.get(ownerDisplayName) || null;
+      const answerCount = (question.answers || []).length;
+
       await client.query(
         `
-        INSERT INTO questions (id, title, body, asked_by, score, views, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO posts (
+          id,
+          post_type_id,
+          creation_date,
+          score,
+          view_count,
+          body,
+          owner_user_id,
+          owner_display_name,
+          title,
+          tags,
+          answer_count,
+          comment_count,
+          favorite_count,
+          content_license
+        )
+        VALUES ($1, 1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, 0, $11)
         `,
         [
           question.id,
-          question.title,
-          question.body,
-          cleanAuthor(question.askedBy),
+          question.createdAt,
           question.score || 0,
           question.views || 0,
-          question.createdAt
+          question.body,
+          ownerUserId,
+          ownerDisplayName,
+          question.title,
+          formatPostTags(questionTags),
+          answerCount,
+          "CC BY-SA 4.0"
         ]
       );
 
-      for (const rawTag of question.tags || []) {
-        const tagName = String(rawTag || "").trim().toLowerCase();
-        if (!tagName) {
-          continue;
-        }
-
-        const description =
-          catalogDescriptions.get(tagName) || `Community tag for ${tagName}`;
-
-        const insertedTagResult = await client.query(
-          `
-          INSERT INTO tags (name, description)
-          VALUES ($1, $2)
-          ON CONFLICT (name) DO NOTHING
-          RETURNING id
-          `,
-          [tagName, description]
-        );
-
-        let tagId = insertedTagResult.rows[0]?.id;
-        if (!tagId) {
-          const existingTagResult = await client.query(
-            "SELECT id FROM tags WHERE name = $1",
-            [tagName]
-          );
-          tagId = existingTagResult.rows[0]?.id;
-        }
-
-        await client.query(
-          `
-          INSERT INTO question_tags (question_id, tag_id)
-          VALUES ($1, $2)
-          ON CONFLICT (question_id, tag_id) DO NOTHING
-          `,
-          [question.id, tagId]
-        );
-      }
-
       for (const answer of question.answers || []) {
+        const answerOwner = cleanDisplayName(answer.author);
+        const answerOwnerId = userIdByName.get(answerOwner) || null;
+        const commentCount = (answer.replies || []).length;
+
         await client.query(
           `
-          INSERT INTO answers (id, question_id, author, score, body, created_at)
-          VALUES ($1, $2, $3, $4, $5, $6)
+          INSERT INTO posts (
+            id,
+            post_type_id,
+            parent_id,
+            creation_date,
+            score,
+            body,
+            owner_user_id,
+            owner_display_name,
+            comment_count,
+            content_license
+          )
+          VALUES ($1, 2, $2, $3, $4, $5, $6, $7, $8, $9)
           `,
           [
             answer.id,
             question.id,
-            cleanAuthor(answer.author),
+            answer.createdAt,
             answer.score || 0,
             answer.body,
-            answer.createdAt
+            answerOwnerId,
+            answerOwner,
+            commentCount,
+            "CC BY-SA 4.0"
           ]
         );
 
         for (const reply of answer.replies || []) {
+          const replyOwner = cleanDisplayName(reply.author);
+          const replyOwnerId = userIdByName.get(replyOwner) || null;
+
           await client.query(
             `
-            INSERT INTO replies (id, answer_id, author, score, body, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO comments (
+              id,
+              post_id,
+              score,
+              text,
+              creation_date,
+              user_display_name,
+              user_id,
+              content_license
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             `,
             [
               reply.id,
               answer.id,
-              cleanAuthor(reply.author),
               reply.score || 0,
               reply.body,
-              reply.createdAt
+              reply.createdAt,
+              replyOwner,
+              replyOwnerId,
+              "CC BY-SA 4.0"
             ]
           );
         }
@@ -123,14 +192,15 @@ async function seedDb() {
     }
 
     await client.query(`
-      SELECT setval(pg_get_serial_sequence('questions', 'id'), COALESCE((SELECT MAX(id) FROM questions), 1), true);
-      SELECT setval(pg_get_serial_sequence('answers', 'id'), COALESCE((SELECT MAX(id) FROM answers), 1), true);
-      SELECT setval(pg_get_serial_sequence('replies', 'id'), COALESCE((SELECT MAX(id) FROM replies), 1), true);
+      SELECT setval(pg_get_serial_sequence('users', 'id'), COALESCE((SELECT MAX(id) FROM users), 1), true);
+      SELECT setval(pg_get_serial_sequence('posts', 'id'), COALESCE((SELECT MAX(id) FROM posts), 1), true);
+      SELECT setval(pg_get_serial_sequence('comments', 'id'), COALESCE((SELECT MAX(id) FROM comments), 1), true);
+      SELECT setval(pg_get_serial_sequence('votes', 'id'), COALESCE((SELECT MAX(id) FROM votes), 1), true);
       SELECT setval(pg_get_serial_sequence('tags', 'id'), COALESCE((SELECT MAX(id) FROM tags), 1), true);
     `);
   });
 
-  console.log(`Seeded ${questions.length} questions.`);
+  console.log(`Seeded ${questions.length} questions into Posts.`);
 }
 
 seedDb()

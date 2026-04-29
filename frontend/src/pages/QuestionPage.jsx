@@ -3,10 +3,10 @@ import { Link, useParams } from "react-router-dom";
 import {
   getQuestion,
   postAnswer,
-  postReply,
+  postComment,
   upvoteAnswer,
   upvoteQuestion,
-  upvoteReply
+  upvoteComment
 } from "../api";
 import Modal from "../components/Modal";
 import QueryInspector from "../components/QueryInspector";
@@ -41,19 +41,19 @@ function appendAnswer(question, answer) {
   };
 }
 
-function appendReplyToAnswer(question, answerId, reply) {
+function appendCommentToAnswer(question, answerId, comment) {
   return {
     ...question,
     answers: question.answers.map((answer) => {
       if (answer.id !== answerId) {
         return answer;
       }
-      return { ...answer, replies: [...(answer.replies || []), reply] };
+      return { ...answer, comments: [...(answer.comments || []), comment] };
     })
   };
 }
 
-function updateReplyScore(question, answerId, replyId, score) {
+function updateCommentScore(question, answerId, commentId, score) {
   return {
     ...question,
     answers: question.answers.map((answer) => {
@@ -62,8 +62,8 @@ function updateReplyScore(question, answerId, replyId, score) {
       }
       return {
         ...answer,
-        replies: (answer.replies || []).map((reply) =>
-          reply.id === replyId ? { ...reply, score } : reply
+        comments: (answer.comments || []).map((comment) =>
+          comment.id === commentId ? { ...comment, score } : comment
         )
       };
     })
@@ -84,10 +84,10 @@ export default function QuestionPage() {
   const [postingAnswer, setPostingAnswer] = useState(false);
   const [answerModalOpen, setAnswerModalOpen] = useState(false);
 
-  const [replyAuthor, setReplyAuthor] = useState("");
-  const [replyBody, setReplyBody] = useState("");
-  const [postingReply, setPostingReply] = useState(false);
-  const [replyModalAnswerId, setReplyModalAnswerId] = useState(null);
+  const [commentAuthor, setCommentAuthor] = useState("");
+  const [commentText, setCommentText] = useState("");
+  const [postingComment, setPostingComment] = useState(false);
+  const [commentModalAnswerId, setCommentModalAnswerId] = useState(null);
   const mutationAbortRef = useRef(null);
 
   useEffect(() => {
@@ -173,10 +173,11 @@ export default function QuestionPage() {
     setActionError("");
     const controller = startMutationSignal();
     try {
-      const response = await postAnswer(question.id, {
-        author: answerAuthor,
-        body: answerBody
-      }, { signal: controller.signal });
+      const response = await postAnswer(
+        question.id,
+        { ownerDisplayName: answerAuthor, body: answerBody },
+        { signal: controller.signal }
+      );
       setQuestion((prev) => (prev ? appendAnswer(prev, response.data) : prev));
       setAnswerAuthor("");
       setAnswerBody("");
@@ -211,44 +212,45 @@ export default function QuestionPage() {
     }
   }
 
-  async function handlePostReply(event) {
+  async function handlePostComment(event) {
     event.preventDefault();
-    if (!question || postingReply || !replyModalAnswerId) {
-      return;
-    }
-    const body = replyBody.trim();
-    const author = replyAuthor.trim();
-    if (!body) {
+    if (!question || postingComment || !commentModalAnswerId) {
       return;
     }
 
-    setPostingReply(true);
+    const text = commentText.trim();
+    const userDisplayName = commentAuthor.trim();
+    if (!text) {
+      return;
+    }
+
+    setPostingComment(true);
     setActionError("");
     const controller = startMutationSignal();
     try {
-      const response = await postReply(
+      const response = await postComment(
         question.id,
-        replyModalAnswerId,
-        { body, author },
+        commentModalAnswerId,
+        { text, userDisplayName },
         { signal: controller.signal }
       );
       setQuestion((prev) =>
-        prev ? appendReplyToAnswer(prev, replyModalAnswerId, response.data) : prev
+        prev ? appendCommentToAnswer(prev, commentModalAnswerId, response.data) : prev
       );
-      setReplyAuthor("");
-      setReplyBody("");
-      setReplyModalAnswerId(null);
+      setCommentAuthor("");
+      setCommentText("");
+      setCommentModalAnswerId(null);
     } catch (requestError) {
       if (requestError?.name === "AbortError") {
         return;
       }
       setActionError(requestError.message);
     } finally {
-      setPostingReply(false);
+      setPostingComment(false);
     }
   }
 
-  async function handleReplyUpvote(answerId, replyId) {
+  async function handleCommentUpvote(answerId, commentId) {
     if (!question || busy) {
       return;
     }
@@ -256,11 +258,11 @@ export default function QuestionPage() {
     setActionError("");
     const controller = startMutationSignal();
     try {
-      const response = await upvoteReply(question.id, answerId, replyId, {
+      const response = await upvoteComment(question.id, answerId, commentId, {
         signal: controller.signal
       });
       setQuestion((prev) =>
-        prev ? updateReplyScore(prev, answerId, replyId, response.data.score) : prev
+        prev ? updateCommentScore(prev, answerId, commentId, response.data.score) : prev
       );
     } catch (requestError) {
       if (requestError?.name === "AbortError") {
@@ -284,9 +286,9 @@ export default function QuestionPage() {
     return <p className="status error">Question not found.</p>;
   }
 
-  const replyTargetAnswer =
-    replyModalAnswerId !== null
-      ? question.answers.find((answer) => answer.id === replyModalAnswerId) || null
+  const commentTargetAnswer =
+    commentModalAnswerId !== null
+      ? question.answers.find((answer) => answer.id === commentModalAnswerId) || null
       : null;
 
   return (
@@ -306,8 +308,8 @@ export default function QuestionPage() {
           ))}
         </div>
         <p className="question-date">
-          asked by {question.askedBy || "anonymous"} • {formatDate(question.createdAt)} •{" "}
-          {question.views || 0} views
+          asked by {question.ownerDisplayName || "anonymous"} • {formatDate(question.creationDate)} •{" "}
+          {question.viewCount || 0} views
         </p>
         <div className="action-row">
           <button
@@ -332,7 +334,7 @@ export default function QuestionPage() {
             <article key={answer.id} className="answer-card">
               <p>{answer.body}</p>
               <p className="question-date">
-                by {answer.author} • {formatDate(answer.createdAt)}
+                by {answer.ownerDisplayName || "anonymous"} • {formatDate(answer.creationDate)}
               </p>
               <div className="action-row">
                 <button
@@ -350,38 +352,37 @@ export default function QuestionPage() {
                   className="reply-toggle"
                   onClick={() => {
                     setActionError("");
-                    setReplyAuthor("");
-                    setReplyBody("");
-                    setReplyModalAnswerId(answer.id);
+                    setCommentAuthor("");
+                    setCommentText("");
+                    setCommentModalAnswerId(answer.id);
                   }}
                 >
-                  Reply
+                  Comment
                 </button>
               </div>
 
               <div className="reply-list">
-                {(answer.replies || []).map((reply) => (
-                  <article key={reply.id} className="reply-card">
-                    <p>{reply.body}</p>
+                {(answer.comments || []).map((comment) => (
+                  <article key={comment.id} className="reply-card">
+                    <p>{comment.text}</p>
                     <p className="question-date">
-                      by {reply.author} • {formatDate(reply.createdAt)}
+                      by {comment.userDisplayName || "anonymous"} • {formatDate(comment.creationDate)}
                     </p>
                     <div className="action-row">
                       <button
                         type="button"
                         className="vote-button"
-                        onClick={() => handleReplyUpvote(answer.id, reply.id)}
+                        onClick={() => handleCommentUpvote(answer.id, comment.id)}
                         disabled={busy}
-                        aria-label="Upvote reply"
-                        title="Upvote reply"
+                        aria-label="Upvote comment"
+                        title="Upvote comment"
                       >
-                        ▲ {reply.score}
+                        ▲ {comment.score}
                       </button>
                     </div>
                   </article>
                 ))}
               </div>
-
             </article>
           ))}
         </div>
@@ -426,27 +427,27 @@ export default function QuestionPage() {
         </Modal>
       )}
 
-      {replyModalAnswerId !== null && replyTargetAnswer && (
+      {commentModalAnswerId !== null && commentTargetAnswer && (
         <Modal
-          title={`Reply to ${replyTargetAnswer.author}`}
-          onClose={() => setReplyModalAnswerId(null)}
-          disableClose={postingReply}
+          title={`Comment on ${commentTargetAnswer.ownerDisplayName || "answer"}`}
+          onClose={() => setCommentModalAnswerId(null)}
+          disableClose={postingComment}
         >
-          <form className="inline-form" onSubmit={handlePostReply}>
+          <form className="inline-form" onSubmit={handlePostComment}>
             <input
               type="text"
               placeholder="Your name (optional)"
-              value={replyAuthor}
-              onChange={(event) => setReplyAuthor(event.target.value)}
+              value={commentAuthor}
+              onChange={(event) => setCommentAuthor(event.target.value)}
             />
             <textarea
-              placeholder="Write your reply..."
-              value={replyBody}
-              onChange={(event) => setReplyBody(event.target.value)}
+              placeholder="Write your comment..."
+              value={commentText}
+              onChange={(event) => setCommentText(event.target.value)}
               required
             />
-            <button type="submit" disabled={postingReply}>
-              {postingReply ? "Posting..." : "Post Reply"}
+            <button type="submit" disabled={postingComment}>
+              {postingComment ? "Posting..." : "Post Comment"}
             </button>
           </form>
         </Modal>

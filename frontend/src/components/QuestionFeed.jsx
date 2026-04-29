@@ -40,14 +40,14 @@ function sortQuestions(items, sortValue) {
       return right.score - left.score;
     }
     if (sortValue === "views_asc") {
-      return (left.views || 0) - (right.views || 0);
+      return (left.viewCount || 0) - (right.viewCount || 0);
     }
     if (sortValue === "views_desc") {
-      return (right.views || 0) - (left.views || 0);
+      return (right.viewCount || 0) - (left.viewCount || 0);
     }
 
-    const leftTime = new Date(left.createdAt).getTime() || 0;
-    const rightTime = new Date(right.createdAt).getTime() || 0;
+    const leftTime = new Date(left.creationDate).getTime() || 0;
+    const rightTime = new Date(right.creationDate).getTime() || 0;
     if (sortValue === "time_asc") {
       return leftTime - rightTime;
     }
@@ -234,7 +234,7 @@ export default function QuestionFeed({
                 <strong>{item.answerCount}</strong> answers
               </p>
               <p>
-                <strong>{item.views || 0}</strong> views
+                <strong>{item.viewCount || 0}</strong> views
               </p>
             </div>
             <div className="question-content">
@@ -249,7 +249,7 @@ export default function QuestionFeed({
                 ))}
               </div>
               <p className="question-date">
-                asked by {item.askedBy || "anonymous"} • {formatCreatedAt(item.createdAt)}
+                asked by {item.ownerDisplayName || "anonymous"} • {formatCreatedAt(item.creationDate)}
               </p>
             </div>
           </article>

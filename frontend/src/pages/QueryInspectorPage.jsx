@@ -2,10 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import { inspectQuery } from "../api";
 
 const EXAMPLE_QUERIES = [
-  "SELECT COUNT(*) FROM se_posts WHERE ViewCount > 100",
-  "SELECT PostTypeId, AVG(Score) FROM se_posts WHERE ViewCount > 100 GROUP BY PostTypeId",
-  "SELECT PostTypeId, AVG(Score), COUNT(*) FROM se_posts WHERE ViewCount > 500 GROUP BY PostTypeId",
-  "SELECT AVG(Score) FROM se_posts WHERE ViewCount > 1000"
+  "SELECT COUNT(*) FROM posts WHERE view_count > 100",
+  "SELECT post_type_id, AVG(score) FROM posts WHERE view_count > 100 GROUP BY post_type_id",
+  "SELECT post_type_id, AVG(score), COUNT(*) FROM posts WHERE view_count > 500 GROUP BY post_type_id",
+  "SELECT AVG(score) FROM posts WHERE view_count > 1000"
 ];
 
 function PlanNode({ line, index }) {

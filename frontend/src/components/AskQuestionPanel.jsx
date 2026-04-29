@@ -9,7 +9,7 @@ export default function AskQuestionPanel() {
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
   const [tags, setTags] = useState("");
-  const [author, setAuthor] = useState("");
+  const [ownerDisplayName, setOwnerDisplayName] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState("");
   const submitAbortRef = useRef(null);
@@ -49,7 +49,7 @@ export default function AskQuestionPanel() {
 
     try {
       const response = await createQuestion(
-        { title, body, tags, author },
+        { title, body, tags, ownerDisplayName },
         { signal: controller.signal }
       );
       const newQuestionId = response?.data?.id;
@@ -83,8 +83,8 @@ export default function AskQuestionPanel() {
             <input
               type="text"
               placeholder="Your name (optional)"
-              value={author}
-              onChange={(event) => setAuthor(event.target.value)}
+              value={ownerDisplayName}
+              onChange={(event) => setOwnerDisplayName(event.target.value)}
             />
             <input
               type="text"

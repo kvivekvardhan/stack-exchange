@@ -65,14 +65,14 @@ export function getQuestion(id, options = {}) {
   return request(`/question/${id}`, {}, options);
 }
 
-export function createQuestion({ title, body, tags, author }, options = {}) {
+export function createQuestion({ title, body, tags, ownerDisplayName }, options = {}) {
   return request(
     "/questions",
     {},
     {
       ...options,
       method: "POST",
-      body: { title, body, tags, author }
+      body: { title, body, tags, ownerDisplayName }
     }
   );
 }
@@ -81,14 +81,14 @@ export function upvoteQuestion(id, options = {}) {
   return request(`/question/${id}/upvote`, {}, { ...options, method: "POST" });
 }
 
-export function postAnswer(questionId, { body, author }, options = {}) {
+export function postAnswer(questionId, { body, ownerDisplayName }, options = {}) {
   return request(
     `/question/${questionId}/answers`,
     {},
     {
       ...options,
       method: "POST",
-      body: { body, author }
+      body: { body, ownerDisplayName }
     }
   );
 }
@@ -100,21 +100,21 @@ export function upvoteAnswer(questionId, answerId, options = {}) {
   });
 }
 
-export function postReply(questionId, answerId, { body, author }, options = {}) {
+export function postComment(questionId, answerId, { text, userDisplayName }, options = {}) {
   return request(
-    `/question/${questionId}/answers/${answerId}/replies`,
+    `/question/${questionId}/answers/${answerId}/comments`,
     {},
     {
       ...options,
       method: "POST",
-      body: { body, author }
+      body: { text, userDisplayName }
     }
   );
 }
 
-export function upvoteReply(questionId, answerId, replyId, options = {}) {
+export function upvoteComment(questionId, answerId, commentId, options = {}) {
   return request(
-    `/question/${questionId}/answers/${answerId}/replies/${replyId}/upvote`,
+    `/question/${questionId}/answers/${answerId}/comments/${commentId}/upvote`,
     {},
     { ...options, method: "POST" }
   );

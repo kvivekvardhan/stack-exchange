@@ -137,16 +137,55 @@ function normalizeTags(rawTags) {
   return [...new Set(tags)].slice(0, 5);
 }
 
+function formatPostTags(tags) {
+  if (!tags || tags.length === 0) {
+    return null;
+  }
+  return tags.map((tag) => `<${tag}>`).join("");
+}
+
+function parsePostTags(rawTags) {
+  const raw = String(rawTags || "").trim();
+  if (!raw) {
+    return [];
+  }
+
+  const tags = [];
+  const matcher = /<([^>]+)>/g;
+  let match;
+  while ((match = matcher.exec(raw))) {
+    tags.push(match[1]);
+  }
+
+  if (tags.length > 0) {
+    return tags;
+  }
+
+  return raw
+    .split(",")
+    .map((tag) => tag.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function formatTagFilter(rawTag) {
+  const tag = String(rawTag || "").trim().toLowerCase();
+  if (!tag) {
+    return "";
+  }
+  return `<${tag}>`;
+}
+
 function mapSearchQuestion(row) {
   return {
     id: row.id,
     title: row.title,
-    tags: row.tags || [],
-    score: row.score,
-    views: row.views || 0,
+    tags: parsePostTags(row.tags),
+    score: row.score || 0,
+    viewCount: row.view_count || 0,
     answerCount: row.answer_count || 0,
-    createdAt: row.created_at,
-    askedBy: row.asked_by || "anonymous"
+    commentCount: row.comment_count || 0,
+    creationDate: row.creation_date,
+    ownerDisplayName: row.owner_display_name || "anonymous"
   };
 }
 
@@ -169,55 +208,57 @@ async function runQuery(engine, sql, params = [], options = {}) {
 }
 
 async function questionExists(engine, questionId) {
-  const result = await queryWithEngine(engine, "SELECT 1 FROM questions WHERE id = $1", [questionId]);
+  const result = await queryWithEngine(
+    engine,
+    "SELECT 1 FROM posts WHERE id = $1 AND post_type_id = 1",
+    [questionId]
+  );
   return result.rowCount > 0;
 }
 
 async function answerBelongsToQuestion(engine, questionId, answerId) {
   const result = await queryWithEngine(
     engine,
-    "SELECT 1 FROM answers WHERE id = $1 AND question_id = $2",
+    "SELECT 1 FROM posts WHERE id = $1 AND parent_id = $2 AND post_type_id = 2",
     [answerId, questionId]
   );
   return result.rowCount > 0;
 }
 
-async function getOrCreateTagId(client, tagName) {
-  const description = `Community tag for ${tagName}`;
+async function upsertTag(client, tagName) {
   const inserted = await client.query(
     `
-    INSERT INTO tags (name, description)
-    VALUES ($1, $2)
-    ON CONFLICT (name) DO NOTHING
+    INSERT INTO tags (tag_name, count)
+    VALUES ($1, 1)
+    ON CONFLICT (tag_name)
+    DO UPDATE SET count = tags.count + 1
     RETURNING id
     `,
-    [tagName, description]
+    [tagName]
   );
 
-  if (inserted.rowCount > 0) {
-    return inserted.rows[0].id;
-  }
-
-  const existing = await client.query("SELECT id FROM tags WHERE name = $1", [tagName]);
-  return existing.rows[0].id;
+  return inserted.rows[0].id;
 }
 
 async function fetchQuestionDetails(engine, questionId, options = {}) {
   const questionQuery = `
     SELECT
-      q.id,
-      q.title,
-      q.body,
-      q.score,
-      q.views,
-      q.created_at,
-      q.asked_by,
-      COALESCE(ARRAY_REMOVE(ARRAY_AGG(t.name ORDER BY t.name), NULL), '{}'::text[]) AS tags
-    FROM questions q
-    LEFT JOIN question_tags qt ON qt.question_id = q.id
-    LEFT JOIN tags t ON t.id = qt.tag_id
-    WHERE q.id = $1
-    GROUP BY q.id
+      p.id,
+      p.title,
+      p.body,
+      p.score,
+      p.view_count,
+      p.answer_count,
+      p.comment_count,
+      p.favorite_count,
+      p.accepted_answer_id,
+      p.creation_date,
+      p.owner_display_name,
+      p.owner_user_id,
+      p.tags
+    FROM posts p
+    WHERE p.id = $1
+      AND p.post_type_id = 1
     LIMIT 1
   `;
   const questionResult = await runQuery(engine, questionQuery, [questionId], {
@@ -231,10 +272,11 @@ async function fetchQuestionDetails(engine, questionId, options = {}) {
   const questionRow = questionResult.result.rows[0];
 
   const answerQuery = `
-    SELECT id, question_id, author, score, body, created_at
-    FROM answers
-    WHERE question_id = $1
-    ORDER BY created_at ASC, id ASC
+    SELECT id, parent_id, owner_display_name, owner_user_id, score, body, creation_date, comment_count
+    FROM posts
+    WHERE parent_id = $1
+      AND post_type_id = 2
+    ORDER BY creation_date ASC, id ASC
   `;
   const answerResult = await runQuery(engine, answerQuery, [questionId], {
     inspect: options.inspect
@@ -247,24 +289,26 @@ async function fetchQuestionDetails(engine, questionId, options = {}) {
     const replyResult = await queryWithEngine(
       engine,
       `
-      SELECT id, answer_id, author, score, body, created_at
-      FROM replies
-      WHERE answer_id = ANY($1::int[])
-      ORDER BY created_at ASC, id ASC
+      SELECT id, post_id, user_display_name, user_id, score, text, creation_date
+      FROM comments
+      WHERE post_id = ANY($1::bigint[])
+      ORDER BY creation_date ASC, id ASC
       `,
       [answerIds]
     );
 
     replyResult.rows.forEach((reply) => {
-      const current = repliesByAnswer.get(reply.answer_id) || [];
+      const current = repliesByAnswer.get(reply.post_id) || [];
       current.push({
         id: reply.id,
-        author: normalizeAuthor(reply.author),
+        postId: reply.post_id,
+        userDisplayName: normalizeAuthor(reply.user_display_name),
+        userId: reply.user_id,
         score: reply.score,
-        body: reply.body,
-        createdAt: reply.created_at
+        text: reply.text,
+        creationDate: reply.creation_date
       });
-      repliesByAnswer.set(reply.answer_id, current);
+      repliesByAnswer.set(reply.post_id, current);
     });
   }
 
@@ -273,18 +317,26 @@ async function fetchQuestionDetails(engine, questionId, options = {}) {
       id: questionRow.id,
       title: questionRow.title,
       body: questionRow.body,
-      tags: questionRow.tags || [],
-      askedBy: normalizeAuthor(questionRow.asked_by),
-      score: questionRow.score,
-      views: questionRow.views || 0,
-      createdAt: questionRow.created_at,
+      tags: parsePostTags(questionRow.tags),
+      ownerDisplayName: normalizeAuthor(questionRow.owner_display_name),
+      ownerUserId: questionRow.owner_user_id,
+      score: questionRow.score || 0,
+      viewCount: questionRow.view_count || 0,
+      answerCount: questionRow.answer_count || 0,
+      commentCount: questionRow.comment_count || 0,
+      favoriteCount: questionRow.favorite_count || 0,
+      acceptedAnswerId: questionRow.accepted_answer_id,
+      creationDate: questionRow.creation_date,
       answers: answerResult.result.rows.map((answer) => ({
         id: answer.id,
-        author: normalizeAuthor(answer.author),
-        score: answer.score,
+        parentId: answer.parent_id,
+        ownerDisplayName: normalizeAuthor(answer.owner_display_name),
+        ownerUserId: answer.owner_user_id,
+        score: answer.score || 0,
         body: answer.body,
-        createdAt: answer.created_at,
-        replies: repliesByAnswer.get(answer.id) || []
+        creationDate: answer.creation_date,
+        commentCount: answer.comment_count || 0,
+        comments: repliesByAnswer.get(answer.id) || []
       }))
     },
     timingMs: Number((questionResult.timingMs + answerResult.timingMs).toFixed(3)),
@@ -323,6 +375,7 @@ app.get(
     const inspect = isInspectorEnabled(req);
     const q = String(req.query.q || "").trim().toLowerCase();
     const tag = String(req.query.tag || "").trim().toLowerCase();
+    const tagFilter = formatTagFilter(tag);
     const minViewsRaw = String(req.query.minViews || "").trim();
     const minViewsParsed = Number.parseInt(minViewsRaw, 10);
     const minViews =
@@ -330,37 +383,24 @@ app.get(
 
     const searchSql = `
       SELECT
-        q.id,
-        q.title,
-        q.score,
-        q.views,
-        q.created_at,
-        q.asked_by,
-        COALESCE(ARRAY_REMOVE(ARRAY_AGG(t.name ORDER BY t.name), NULL), '{}'::text[]) AS tags,
-        COALESCE(answer_counts.answer_count, 0)::int AS answer_count
-      FROM questions q
-      LEFT JOIN question_tags qt ON qt.question_id = q.id
-      LEFT JOIN tags t ON t.id = qt.tag_id
-      LEFT JOIN LATERAL (
-        SELECT COUNT(*)::int AS answer_count
-        FROM answers a
-        WHERE a.question_id = q.id
-      ) AS answer_counts ON TRUE
-      WHERE ($1 = '' OR LOWER(q.title || ' ' || q.body) LIKE '%' || $1 || '%')
-        AND (
-          $2 = '' OR EXISTS (
-            SELECT 1
-            FROM question_tags qtf
-            JOIN tags tf ON tf.id = qtf.tag_id
-            WHERE qtf.question_id = q.id
-              AND LOWER(tf.name) LIKE '%' || $2 || '%'
-          )
-        )
-        AND q.views >= $3
-      GROUP BY q.id, answer_counts.answer_count
-      ORDER BY q.score DESC, q.created_at DESC
+        p.id,
+        p.title,
+        p.score,
+        p.view_count,
+        p.answer_count,
+        p.comment_count,
+        p.creation_date,
+        p.owner_display_name,
+        p.tags
+      FROM posts p
+      WHERE p.post_type_id = 1
+        AND p.deletion_date IS NULL
+        AND ($1 = '' OR LOWER(COALESCE(p.title, '') || ' ' || p.body) LIKE '%' || $1 || '%')
+        AND ($2 = '' OR p.tags ILIKE '%' || $2 || '%')
+        AND p.view_count >= $3
+      ORDER BY p.score DESC, p.creation_date DESC
     `;
-    const searchResult = await runQuery(engine, searchSql, [q, tag, minViews], { inspect });
+    const searchResult = await runQuery(engine, searchSql, [q, tagFilter, minViews], { inspect });
 
     const responseRows = searchResult.result.rows.map(mapSearchQuestion);
     const timingMs = searchResult.timingMs;
@@ -376,7 +416,7 @@ app.get(
               {
                 name: "search",
                 sql: searchSql.trim(),
-                params: [q, tag, minViews],
+                params: [q, tagFilter, minViews],
                 plan: searchResult.plan
               }
             ]
@@ -399,7 +439,7 @@ app.get(
     }
 
     if (shouldCountView(req, questionId)) {
-      await queryWithEngine(engine, "UPDATE questions SET views = views + 1 WHERE id = $1", [
+      await queryWithEngine(engine, "UPDATE posts SET view_count = view_count + 1 WHERE id = $1", [
         questionId
       ]);
     }
@@ -427,7 +467,7 @@ app.post(
     const engine = getEngine(req);
     const title = String(req.body?.title || "").trim();
     const body = String(req.body?.body || "").trim();
-    const author = normalizeAuthor(req.body?.author);
+    const ownerDisplayName = normalizeAuthor(req.body?.ownerDisplayName);
 
     if (!title) {
       return badRequest(res, "Question title is required");
@@ -438,40 +478,38 @@ app.post(
     }
 
     const tags = normalizeTags(req.body?.tags);
+    const tagString = formatPostTags(tags);
 
     const question = await withTransactionEngine(engine, async (client) => {
       const inserted = await client.query(
         `
-        INSERT INTO questions (title, body, asked_by)
-        VALUES ($1, $2, $3)
-        RETURNING id, title, body, asked_by, score, views, created_at
+        INSERT INTO posts (post_type_id, title, body, owner_display_name, tags)
+        VALUES (1, $1, $2, $3, $4)
+        RETURNING id, title, body, owner_display_name, score, view_count, answer_count,
+                  comment_count, favorite_count, accepted_answer_id, creation_date, tags
         `,
-        [title, body, author]
+        [title, body, ownerDisplayName, tagString]
       );
 
       const insertedQuestion = inserted.rows[0];
 
       for (const tagName of tags) {
-        const tagId = await getOrCreateTagId(client, tagName);
-        await client.query(
-          `
-          INSERT INTO question_tags (question_id, tag_id)
-          VALUES ($1, $2)
-          ON CONFLICT (question_id, tag_id) DO NOTHING
-          `,
-          [insertedQuestion.id, tagId]
-        );
+        await upsertTag(client, tagName);
       }
 
       return {
         id: insertedQuestion.id,
         title: insertedQuestion.title,
         body: insertedQuestion.body,
-        tags,
-        askedBy: normalizeAuthor(insertedQuestion.asked_by),
+        tags: parsePostTags(insertedQuestion.tags),
+        ownerDisplayName: normalizeAuthor(insertedQuestion.owner_display_name),
         score: insertedQuestion.score,
-        views: insertedQuestion.views,
-        createdAt: insertedQuestion.created_at,
+        viewCount: insertedQuestion.view_count,
+        answerCount: insertedQuestion.answer_count,
+        commentCount: insertedQuestion.comment_count,
+        favoriteCount: insertedQuestion.favorite_count,
+        acceptedAnswerId: insertedQuestion.accepted_answer_id,
+        creationDate: insertedQuestion.creation_date,
         answers: []
       };
     });
@@ -496,7 +534,7 @@ app.post(
     const updated = await queryWithEngine(
       engine,
       `
-      UPDATE questions
+      UPDATE posts
       SET score = score + 1
       WHERE id = $1
       RETURNING id, score
@@ -507,6 +545,15 @@ app.post(
     if (updated.rowCount === 0) {
       return notFound(res, `Question with id ${req.params.id} was not found`);
     }
+
+    await queryWithEngine(
+      engine,
+      `
+      INSERT INTO votes (post_id, vote_type_id, creation_date)
+      VALUES ($1, 2, NOW())
+      `,
+      [questionId]
+    );
 
     return res.json({
       message: "Question upvoted",
@@ -530,33 +577,45 @@ app.post(
     }
 
     const body = String(req.body?.body || "").trim();
-    const author = normalizeAuthor(req.body?.author);
+    const ownerDisplayName = normalizeAuthor(req.body?.ownerDisplayName);
 
     if (!body) {
       return badRequest(res, "Answer body is required");
     }
 
-    const inserted = await queryWithEngine(
-      engine,
-      `
-      INSERT INTO answers (question_id, author, body)
-      VALUES ($1, $2, $3)
-      RETURNING id, author, score, body, created_at
-      `,
-      [questionId, author, body]
-    );
+    const answer = await withTransactionEngine(engine, async (client) => {
+      const inserted = await client.query(
+        `
+        INSERT INTO posts (post_type_id, parent_id, body, owner_display_name)
+        VALUES (2, $1, $2, $3)
+        RETURNING id, parent_id, owner_display_name, score, body, creation_date, comment_count
+        `,
+        [questionId, body, ownerDisplayName]
+      );
 
-    const answer = inserted.rows[0];
+      await client.query(
+        `
+        UPDATE posts
+        SET answer_count = answer_count + 1
+        WHERE id = $1
+        `,
+        [questionId]
+      );
+
+      return inserted.rows[0];
+    });
 
     return res.status(201).json({
       message: "Answer posted",
       data: {
         id: answer.id,
-        author: normalizeAuthor(answer.author),
+        parentId: answer.parent_id,
+        ownerDisplayName: normalizeAuthor(answer.owner_display_name),
         score: answer.score,
         body: answer.body,
-        createdAt: answer.created_at,
-        replies: []
+        creationDate: answer.creation_date,
+        commentCount: answer.comment_count || 0,
+        comments: []
       },
       meta: { engine }
     });
@@ -581,9 +640,9 @@ app.post(
     const updated = await queryWithEngine(
       engine,
       `
-      UPDATE answers
+      UPDATE posts
       SET score = score + 1
-      WHERE id = $1 AND question_id = $2
+      WHERE id = $1 AND parent_id = $2 AND post_type_id = 2
       RETURNING id, score
       `,
       [answerId, questionId]
@@ -597,6 +656,15 @@ app.post(
       return notFound(res, `Answer with id ${req.params.answerId} was not found`);
     }
 
+    await queryWithEngine(
+      engine,
+      `
+      INSERT INTO votes (post_id, vote_type_id, creation_date)
+      VALUES ($1, 2, NOW())
+      `,
+      [answerId]
+    );
+
     return res.json({
       message: "Answer upvoted",
       data: updated.rows[0],
@@ -606,7 +674,7 @@ app.post(
 );
 
 app.post(
-  "/question/:questionId/answers/:answerId/replies",
+  "/question/:questionId/answers/:answerId/comments",
   asyncHandler(async (req, res) => {
     const engine = getEngine(req);
     const questionId = toIntegerId(req.params.questionId);
@@ -628,33 +696,45 @@ app.post(
       return notFound(res, `Answer with id ${req.params.answerId} was not found`);
     }
 
-    const body = String(req.body?.body || "").trim();
-    const author = normalizeAuthor(req.body?.author);
+    const text = String(req.body?.text || req.body?.body || "").trim();
+    const userDisplayName = normalizeAuthor(req.body?.userDisplayName);
 
-    if (!body) {
-      return badRequest(res, "Reply body is required");
+    if (!text) {
+      return badRequest(res, "Comment text is required");
     }
 
-    const inserted = await queryWithEngine(
-      engine,
-      `
-      INSERT INTO replies (answer_id, author, body)
-      VALUES ($1, $2, $3)
-      RETURNING id, author, score, body, created_at
-      `,
-      [answerId, author, body]
-    );
+    const comment = await withTransactionEngine(engine, async (client) => {
+      const inserted = await client.query(
+        `
+        INSERT INTO comments (post_id, user_display_name, text)
+        VALUES ($1, $2, $3)
+        RETURNING id, post_id, user_display_name, user_id, score, text, creation_date
+        `,
+        [answerId, userDisplayName, text]
+      );
 
-    const reply = inserted.rows[0];
+      await client.query(
+        `
+        UPDATE posts
+        SET comment_count = comment_count + 1
+        WHERE id = $1
+        `,
+        [answerId]
+      );
+
+      return inserted.rows[0];
+    });
 
     return res.status(201).json({
-      message: "Reply posted",
+      message: "Comment posted",
       data: {
-        id: reply.id,
-        author: normalizeAuthor(reply.author),
-        score: reply.score,
-        body: reply.body,
-        createdAt: reply.created_at
+        id: comment.id,
+        postId: comment.post_id,
+        userDisplayName: normalizeAuthor(comment.user_display_name),
+        userId: comment.user_id,
+        score: comment.score,
+        text: comment.text,
+        creationDate: comment.creation_date
       },
       meta: { engine }
     });
@@ -662,12 +742,12 @@ app.post(
 );
 
 app.post(
-  "/question/:questionId/answers/:answerId/replies/:replyId/upvote",
+  "/question/:questionId/answers/:answerId/comments/:commentId/upvote",
   asyncHandler(async (req, res) => {
     const engine = getEngine(req);
     const questionId = toIntegerId(req.params.questionId);
     const answerId = toIntegerId(req.params.answerId);
-    const replyId = toIntegerId(req.params.replyId);
+    const commentId = toIntegerId(req.params.commentId);
 
     if (!questionId) {
       return notFound(res, `Question with id ${req.params.questionId} was not found`);
@@ -677,23 +757,24 @@ app.post(
       return notFound(res, `Answer with id ${req.params.answerId} was not found`);
     }
 
-    if (!replyId) {
-      return notFound(res, `Reply with id ${req.params.replyId} was not found`);
+    if (!commentId) {
+      return notFound(res, `Comment with id ${req.params.commentId} was not found`);
     }
 
     const updated = await queryWithEngine(
       engine,
       `
-      UPDATE replies AS r
-      SET score = r.score + 1
-      FROM answers AS a
-      WHERE r.id = $1
-        AND r.answer_id = a.id
-        AND a.id = $2
-        AND a.question_id = $3
-      RETURNING r.id, r.score
+      UPDATE comments AS c
+      SET score = c.score + 1
+      FROM posts AS p
+      WHERE c.id = $1
+        AND c.post_id = p.id
+        AND p.id = $2
+        AND p.parent_id = $3
+        AND p.post_type_id = 2
+      RETURNING c.id, c.score
       `,
-      [replyId, answerId, questionId]
+      [commentId, answerId, questionId]
     );
 
     if (updated.rowCount === 0) {
@@ -705,11 +786,11 @@ app.post(
         return notFound(res, `Answer with id ${req.params.answerId} was not found`);
       }
 
-      return notFound(res, `Reply with id ${req.params.replyId} was not found`);
+      return notFound(res, `Comment with id ${req.params.commentId} was not found`);
     }
 
     return res.json({
-      message: "Reply upvoted",
+      message: "Comment upvoted",
       data: updated.rows[0],
       meta: { engine }
     });
@@ -724,12 +805,10 @@ app.get(
     const search = String(req.query.q || "").trim().toLowerCase();
 
     const tagsSql = `
-      SELECT t.id, t.name, t.description, COUNT(qt.question_id)::int AS question_count
+      SELECT t.id, t.tag_name, t.count
       FROM tags t
-      LEFT JOIN question_tags qt ON qt.tag_id = t.id
-      WHERE ($1 = '' OR LOWER(t.name) LIKE '%' || $1 || '%')
-      GROUP BY t.id
-      ORDER BY question_count DESC, t.name ASC
+      WHERE ($1 = '' OR LOWER(t.tag_name) LIKE '%' || $1 || '%')
+      ORDER BY t.count DESC, t.tag_name ASC
       LIMIT 100
     `;
 
@@ -754,9 +833,8 @@ app.get(
       },
       data: tagResult.result.rows.map((row) => ({
         id: row.id,
-        name: row.name,
-        description: row.description,
-        questionCount: row.question_count
+        name: row.tag_name,
+        questionCount: row.count
       }))
     });
   })
@@ -768,15 +846,17 @@ app.get(
     const inspect = isInspectorEnabled(req);
     const searchTerm = String(req.query.q || "postgres").trim().toLowerCase();
     const tagTerm = String(req.query.tag || "sql").trim().toLowerCase();
+    const tagFilter = formatTagFilter(tagTerm);
 
     const queries = [
       {
         name: "search",
         sql: `
-          SELECT q.id
-          FROM questions q
-          WHERE ($1 = '' OR LOWER(q.title || ' ' || q.body) LIKE '%' || $1 || '%')
-          ORDER BY q.score DESC, q.created_at DESC
+          SELECT p.id
+          FROM posts p
+          WHERE p.post_type_id = 1
+            AND ($1 = '' OR LOWER(COALESCE(p.title, '') || ' ' || p.body) LIKE '%' || $1 || '%')
+          ORDER BY p.score DESC, p.creation_date DESC
           LIMIT 25
         `,
         params: [searchTerm]
@@ -784,28 +864,21 @@ app.get(
       {
         name: "tag_filter",
         sql: `
-          SELECT q.id
-          FROM questions q
-          WHERE ($1 = '' OR EXISTS (
-            SELECT 1
-            FROM question_tags qt
-            JOIN tags t ON t.id = qt.tag_id
-            WHERE qt.question_id = q.id
-              AND LOWER(t.name) LIKE '%' || $1 || '%'
-          ))
-          ORDER BY q.score DESC, q.created_at DESC
+          SELECT p.id
+          FROM posts p
+          WHERE p.post_type_id = 1
+            AND ($1 = '' OR p.tags ILIKE '%' || $1 || '%')
+          ORDER BY p.score DESC, p.creation_date DESC
           LIMIT 25
         `,
-        params: [tagTerm]
+        params: [tagFilter]
       },
       {
         name: "tag_aggregate",
         sql: `
-          SELECT t.name, COUNT(qt.question_id)::int AS question_count
+          SELECT t.tag_name, t.count
           FROM tags t
-          LEFT JOIN question_tags qt ON qt.tag_id = t.id
-          GROUP BY t.id
-          ORDER BY question_count DESC
+          ORDER BY t.count DESC
           LIMIT 10
         `,
         params: []
