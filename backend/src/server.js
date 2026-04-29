@@ -210,7 +210,7 @@ async function runQuery(engine, sql, params = [], options = {}) {
 async function questionExists(engine, questionId) {
   const result = await queryWithEngine(
     engine,
-    "SELECT 1 FROM posts WHERE id = $1 AND post_type_id = 1",
+    "SELECT 1 FROM posts WHERE id = $1 AND posttypeid = 1",
     [questionId]
   );
   return result.rowCount > 0;
@@ -219,7 +219,7 @@ async function questionExists(engine, questionId) {
 async function answerBelongsToQuestion(engine, questionId, answerId) {
   const result = await queryWithEngine(
     engine,
-    "SELECT 1 FROM posts WHERE id = $1 AND parent_id = $2 AND post_type_id = 2",
+    "SELECT 1 FROM posts WHERE id = $1 AND parentid = $2 AND posttypeid = 2",
     [answerId, questionId]
   );
   return result.rowCount > 0;
@@ -228,9 +228,12 @@ async function answerBelongsToQuestion(engine, questionId, answerId) {
 async function upsertTag(client, tagName) {
   const inserted = await client.query(
     `
-    INSERT INTO tags (tag_name, count)
-    VALUES ($1, 1)
-    ON CONFLICT (tag_name)
+    INSERT INTO tags (id, tagname, count)
+    VALUES (
+      (SELECT COALESCE(MAX(id), 0) + 1 FROM tags),
+      $1, 1
+    )
+    ON CONFLICT (tagname)
     DO UPDATE SET count = tags.count + 1
     RETURNING id
     `,
@@ -247,18 +250,18 @@ async function fetchQuestionDetails(engine, questionId, options = {}) {
       p.title,
       p.body,
       p.score,
-      p.view_count,
-      p.answer_count,
-      p.comment_count,
-      p.favorite_count,
-      p.accepted_answer_id,
-      p.creation_date,
-      p.owner_display_name,
-      p.owner_user_id,
+      p.viewcount         AS view_count,
+      p.answercount       AS answer_count,
+      p.commentcount      AS comment_count,
+      p.favoritecount     AS favorite_count,
+      p.acceptedanswerid  AS accepted_answer_id,
+      p.creationdate      AS creation_date,
+      p.ownerdisplayname  AS owner_display_name,
+      p.owneruserid       AS owner_user_id,
       p.tags
     FROM posts p
     WHERE p.id = $1
-      AND p.post_type_id = 1
+      AND p.posttypeid = 1
     LIMIT 1
   `;
   const questionResult = await runQuery(engine, questionQuery, [questionId], {
@@ -272,11 +275,19 @@ async function fetchQuestionDetails(engine, questionId, options = {}) {
   const questionRow = questionResult.result.rows[0];
 
   const answerQuery = `
-    SELECT id, parent_id, owner_display_name, owner_user_id, score, body, creation_date, comment_count
+    SELECT
+      id,
+      parentid          AS parent_id,
+      ownerdisplayname  AS owner_display_name,
+      owneruserid       AS owner_user_id,
+      score,
+      body,
+      creationdate      AS creation_date,
+      commentcount      AS comment_count
     FROM posts
-    WHERE parent_id = $1
-      AND post_type_id = 2
-    ORDER BY creation_date ASC, id ASC
+    WHERE parentid = $1
+      AND posttypeid = 2
+    ORDER BY creationdate ASC, id ASC
   `;
   const answerResult = await runQuery(engine, answerQuery, [questionId], {
     inspect: options.inspect
@@ -289,10 +300,17 @@ async function fetchQuestionDetails(engine, questionId, options = {}) {
     const replyResult = await queryWithEngine(
       engine,
       `
-      SELECT id, post_id, user_display_name, user_id, score, text, creation_date
+      SELECT
+        id,
+        postid             AS post_id,
+        userdisplayname    AS user_display_name,
+        userid             AS user_id,
+        score,
+        text,
+        creationdate       AS creation_date
       FROM comments
-      WHERE post_id = ANY($1::bigint[])
-      ORDER BY creation_date ASC, id ASC
+      WHERE postid = ANY($1::bigint[])
+      ORDER BY creationdate ASC, id ASC
       `,
       [answerIds]
     );
@@ -386,19 +404,19 @@ app.get(
         p.id,
         p.title,
         p.score,
-        p.view_count,
-        p.answer_count,
-        p.comment_count,
-        p.creation_date,
-        p.owner_display_name,
+        p.viewcount         AS view_count,
+        p.answercount       AS answer_count,
+        p.commentcount      AS comment_count,
+        p.creationdate      AS creation_date,
+        p.ownerdisplayname  AS owner_display_name,
         p.tags
       FROM posts p
-      WHERE p.post_type_id = 1
-        AND p.deletion_date IS NULL
+      WHERE p.posttypeid = 1
         AND ($1 = '' OR LOWER(COALESCE(p.title, '') || ' ' || p.body) LIKE '%' || $1 || '%')
         AND ($2 = '' OR p.tags ILIKE '%' || $2 || '%')
-        AND p.view_count >= $3
-      ORDER BY p.score DESC, p.creation_date DESC
+        AND p.viewcount >= $3
+      ORDER BY p.score DESC, p.creationdate DESC
+      LIMIT 100
     `;
     const searchResult = await runQuery(engine, searchSql, [q, tagFilter, minViews], { inspect });
 
@@ -439,7 +457,7 @@ app.get(
     }
 
     if (shouldCountView(req, questionId)) {
-      await queryWithEngine(engine, "UPDATE posts SET view_count = view_count + 1 WHERE id = $1", [
+      await queryWithEngine(engine, "UPDATE posts SET viewcount = COALESCE(viewcount, 0) + 1 WHERE id = $1", [
         questionId
       ]);
     }
@@ -483,10 +501,22 @@ app.post(
     const question = await withTransactionEngine(engine, async (client) => {
       const inserted = await client.query(
         `
-        INSERT INTO posts (post_type_id, title, body, owner_display_name, tags)
-        VALUES (1, $1, $2, $3, $4)
-        RETURNING id, title, body, owner_display_name, score, view_count, answer_count,
-                  comment_count, favorite_count, accepted_answer_id, creation_date, tags
+        INSERT INTO posts (
+          posttypeid, title, body, ownerdisplayname, tags,
+          creationdate, contentlicense
+        )
+        VALUES (1, $1, $2, $3, $4, NOW(), 'CC BY-SA 4.0')
+        RETURNING
+          id, title, body,
+          ownerdisplayname  AS owner_display_name,
+          score,
+          viewcount         AS view_count,
+          answercount       AS answer_count,
+          commentcount      AS comment_count,
+          favoritecount     AS favorite_count,
+          acceptedanswerid  AS accepted_answer_id,
+          creationdate      AS creation_date,
+          tags
         `,
         [title, body, ownerDisplayName, tagString]
       );
@@ -549,8 +579,8 @@ app.post(
     await queryWithEngine(
       engine,
       `
-      INSERT INTO votes (post_id, vote_type_id, creation_date)
-      VALUES ($1, 2, NOW())
+      INSERT INTO votes (id, postid, votetypeid, creationdate)
+      VALUES ((SELECT COALESCE(MAX(id), 0) + 1 FROM votes), $1, 2, NOW())
       `,
       [questionId]
     );
@@ -586,9 +616,19 @@ app.post(
     const answer = await withTransactionEngine(engine, async (client) => {
       const inserted = await client.query(
         `
-        INSERT INTO posts (post_type_id, parent_id, body, owner_display_name)
-        VALUES (2, $1, $2, $3)
-        RETURNING id, parent_id, owner_display_name, score, body, creation_date, comment_count
+        INSERT INTO posts (
+          posttypeid, parentid, body, ownerdisplayname,
+          creationdate, contentlicense
+        )
+        VALUES (2, $1, $2, $3, NOW(), 'CC BY-SA 4.0')
+        RETURNING
+          id,
+          parentid          AS parent_id,
+          ownerdisplayname  AS owner_display_name,
+          score,
+          body,
+          creationdate      AS creation_date,
+          commentcount      AS comment_count
         `,
         [questionId, body, ownerDisplayName]
       );
@@ -596,7 +636,7 @@ app.post(
       await client.query(
         `
         UPDATE posts
-        SET answer_count = answer_count + 1
+        SET answercount = COALESCE(answercount, 0) + 1
         WHERE id = $1
         `,
         [questionId]
@@ -642,7 +682,7 @@ app.post(
       `
       UPDATE posts
       SET score = score + 1
-      WHERE id = $1 AND parent_id = $2 AND post_type_id = 2
+      WHERE id = $1 AND parentid = $2 AND posttypeid = 2
       RETURNING id, score
       `,
       [answerId, questionId]
@@ -659,8 +699,8 @@ app.post(
     await queryWithEngine(
       engine,
       `
-      INSERT INTO votes (post_id, vote_type_id, creation_date)
-      VALUES ($1, 2, NOW())
+      INSERT INTO votes (id, postid, votetypeid, creationdate)
+      VALUES ((SELECT COALESCE(MAX(id), 0) + 1 FROM votes), $1, 2, NOW())
       `,
       [answerId]
     );
@@ -706,9 +746,19 @@ app.post(
     const comment = await withTransactionEngine(engine, async (client) => {
       const inserted = await client.query(
         `
-        INSERT INTO comments (post_id, user_display_name, text)
-        VALUES ($1, $2, $3)
-        RETURNING id, post_id, user_display_name, user_id, score, text, creation_date
+        INSERT INTO comments (
+          postid, userdisplayname, text,
+          creationdate, contentlicense
+        )
+        VALUES ($1, $2, $3, NOW(), 'CC BY-SA 4.0')
+        RETURNING
+          id,
+          postid             AS post_id,
+          userdisplayname    AS user_display_name,
+          userid             AS user_id,
+          score,
+          text,
+          creationdate       AS creation_date
         `,
         [answerId, userDisplayName, text]
       );
@@ -716,7 +766,7 @@ app.post(
       await client.query(
         `
         UPDATE posts
-        SET comment_count = comment_count + 1
+        SET commentcount = COALESCE(commentcount, 0) + 1
         WHERE id = $1
         `,
         [answerId]
@@ -768,10 +818,10 @@ app.post(
       SET score = c.score + 1
       FROM posts AS p
       WHERE c.id = $1
-        AND c.post_id = p.id
+        AND c.postid = p.id
         AND p.id = $2
-        AND p.parent_id = $3
-        AND p.post_type_id = 2
+        AND p.parentid = $3
+        AND p.posttypeid = 2
       RETURNING c.id, c.score
       `,
       [commentId, answerId, questionId]
@@ -805,10 +855,10 @@ app.get(
     const search = String(req.query.q || "").trim().toLowerCase();
 
     const tagsSql = `
-      SELECT t.id, t.tag_name, t.count
+      SELECT t.id, t.tagname AS tag_name, t.count
       FROM tags t
-      WHERE ($1 = '' OR LOWER(t.tag_name) LIKE '%' || $1 || '%')
-      ORDER BY t.count DESC, t.tag_name ASC
+      WHERE ($1 = '' OR LOWER(t.tagname) LIKE '%' || $1 || '%')
+      ORDER BY t.count DESC, t.tagname ASC
       LIMIT 100
     `;
 
@@ -854,9 +904,9 @@ app.get(
         sql: `
           SELECT p.id
           FROM posts p
-          WHERE p.post_type_id = 1
+          WHERE p.posttypeid = 1
             AND ($1 = '' OR LOWER(COALESCE(p.title, '') || ' ' || p.body) LIKE '%' || $1 || '%')
-          ORDER BY p.score DESC, p.creation_date DESC
+          ORDER BY p.score DESC, p.creationdate DESC
           LIMIT 25
         `,
         params: [searchTerm]
@@ -866,9 +916,9 @@ app.get(
         sql: `
           SELECT p.id
           FROM posts p
-          WHERE p.post_type_id = 1
+          WHERE p.posttypeid = 1
             AND ($1 = '' OR p.tags ILIKE '%' || $1 || '%')
-          ORDER BY p.score DESC, p.creation_date DESC
+          ORDER BY p.score DESC, p.creationdate DESC
           LIMIT 25
         `,
         params: [tagFilter]
@@ -876,7 +926,7 @@ app.get(
       {
         name: "tag_aggregate",
         sql: `
-          SELECT t.tag_name, t.count
+          SELECT t.tagname AS tag_name, t.count
           FROM tags t
           ORDER BY t.count DESC
           LIMIT 10
@@ -943,7 +993,7 @@ app.post(
     async function inspectEngine(engine) {
       return withTransactionEngine(engine, async (client) => {
         await client.query("SET TRANSACTION READ ONLY");
-        await client.query("SET LOCAL statement_timeout = $1", [`${INSPECT_TIMEOUT}ms`]);
+        await client.query(`SET LOCAL statement_timeout = ${Number(INSPECT_TIMEOUT)}`);
 
         const start = process.hrtime.bigint();
         let result, error = null;
