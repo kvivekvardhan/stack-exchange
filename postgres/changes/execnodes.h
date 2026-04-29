@@ -1478,7 +1478,17 @@ typedef struct ScanState
     int64       vec_total_passed;   /* total tuples passed across scan */
     int64       vec_total_filtered; /* total tuples filtered across scan */
 
-    /* VECTORIZED: aggregate state (dynamic groups for se_posts) */
+    /* VECTORIZED: cached attribute mapping resolved from the catalog on first
+     * call (replaces hardcoded VEC_COL_* indices). InvalidAttrNumber (0) means
+     * the column is not present, in which case the dependent fast-path is
+     * disabled and the engine falls back to standard execution.
+     */
+    Oid         vec_target_oid;     /* RelationGetRelid for the matched table */
+    AttrNumber  vec_att_posttype;   /* attno of PostTypeId / post_type_id */
+    AttrNumber  vec_att_score;      /* attno of Score / score */
+    AttrNumber  vec_att_viewcount;  /* attno of ViewCount / view_count (optional) */
+
+    /* VECTORIZED: aggregate state (dynamic groups keyed on PostTypeId) */
     int32      *vec_agg_keys;       /* group key values (PostTypeId) */
     int64      *vec_agg_sum_i64;    /* exact sum(score) per group */
     int64      *vec_agg_count;      /* count(*) per group */

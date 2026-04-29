@@ -9,10 +9,10 @@ OUT_DIR=${OUT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 OUT_FILE=${OUT_FILE:-$OUT_DIR/results.md}
 
 queries=(
-  "SELECT COUNT(*) FROM se_posts WHERE ViewCount > 100;"
-  "SELECT PostTypeId, AVG(Score) FROM se_posts WHERE ViewCount > 100 GROUP BY PostTypeId;"
-  "SELECT PostTypeId, AVG(Score), COUNT(*) FROM se_posts WHERE ViewCount > 500 GROUP BY PostTypeId;"
-  "SELECT AVG(Score) FROM se_posts WHERE ViewCount > 1000;"
+  "SELECT COUNT(*) FROM posts WHERE ViewCount > 100;"
+  "SELECT PostTypeId, AVG(Score) FROM posts WHERE ViewCount > 100 GROUP BY PostTypeId;"
+  "SELECT PostTypeId, AVG(Score), COUNT(*) FROM posts WHERE ViewCount > 500 GROUP BY PostTypeId;"
+  "SELECT AVG(Score) FROM posts WHERE ViewCount > 1000;"
 )
 
 function run_query() {

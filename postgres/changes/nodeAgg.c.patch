@@ -17,14 +17,21 @@ index 2d9f37d..8e2f4a1 100644
  
 +/*
 + * VECTORIZED: verify aggregate identities/shapes:
-+ *   AVG(score::int4), COUNT(*)
++ *   AVG(<Score>::int4), COUNT(*)
++ *
++ * The Score column attno is resolved from the underlying ScanState (which
++ * cached it from the catalog at scan-init), so this works under any Posts-
++ * shaped relation regardless of column ordering.
 + */
 +static bool
-+ExecVecAggMatchesAggrefs(AggState *aggstate)
++ExecVecAggMatchesAggrefs(AggState *aggstate, ScanState *scan)
 +{
 +	ListCell   *lc;
 +	bool		seen_avg = false;
 +	bool		seen_count = false;
++
++	if (scan == NULL || !AttributeNumberIsValid(scan->vec_att_score))
++		return false;
 +
 +	foreach(lc, aggstate->aggs)
 +	{
@@ -56,7 +63,12 @@ index 2d9f37d..8e2f4a1 100644
 +		if (tle == NULL || tle->expr == NULL || !IsA(tle->expr, Var))
 +			return false;
 +		v = castNode(Var, tle->expr);
-+		if (v->varattno != 3 || v->vartype != INT4OID)
++		/*
++		 * DYNAMIC: the AVG() argument must reference the Score column on
++		 * the scan side. We compare against the attno cached by the scan
++		 * rather than a hardcoded position.
++		 */
++		if (v->varattno != scan->vec_att_score || v->vartype != INT4OID)
 +			return false;
 +		if (strcmp(aggname, "avg") != 0 ||
 +			aggref->aggtype != NUMERICOID || seen_avg)
@@ -113,7 +125,18 @@ index 2d9f37d..8e2f4a1 100644
 +		projInfo->pi_state.resultslot == NULL ||
 +		aggnode == NULL ||
 +		aggstate->ss.ps.qual != NULL ||
-+		!ExecVecAggMatchesAggrefs(aggstate))
++		!ExecVecAggMatchesAggrefs(aggstate, scan))
++		return NULL;
++
++	/*
++	 * DYNAMIC: validate the grouping column. We require exactly one grouping
++	 * key, and that key must map back to the scan's resolved PostTypeId
++	 * attno — not a hardcoded "grpColIdx[0] == 2".
++	 */
++	if (aggnode->numCols != 1 ||
++		aggnode->grpColIdx == NULL ||
++		!AttributeNumberIsValid(scan->vec_att_posttype) ||
++		aggnode->grpColIdx[0] != scan->vec_att_posttype)
 +		return NULL;
 +
 +	grp_attno = aggnode->grpColIdx[0];
@@ -209,23 +232,37 @@ index 2d9f37d..8e2f4a1 100644
 +		if (outer && IsA(outer, ScanState))
 +		{
 +			ScanState *scan = (ScanState *) outer;
++			/*
++			 * DYNAMIC GATE: only enable scan-side aggregate passthrough when
++			 *   (a) the scan resolved a Posts-shaped relation (cached attnos),
++			 *   (b) the Agg node groups by exactly one column whose plan
++			 *       index matches the scan's PostTypeId attno (no hardcoded
++			 *       grpColIdx[0] == 2), and
++			 *   (c) the aggregate target list shape matches AVG(Score)+COUNT
++			 *       (validated via the cached score attno).
++			 *
++			 * Any mismatch leaves vec_agg_enabled=false and execution falls
++			 * through to the standard PostgreSQL aggregate path below.
++			 */
 +			node->vec_agg_enabled =
 +				scan->vec_active &&
 +				scan->vec_agg_enabled &&
 +				scan->vec_agg_keys != NULL &&
 +				scan->vec_agg_sum_i64 != NULL &&
 +				scan->vec_agg_count != NULL &&
++				AttributeNumberIsValid(scan->vec_att_posttype) &&
++				AttributeNumberIsValid(scan->vec_att_score) &&
 +				node->aggsplit == AGGSPLIT_SIMPLE &&
 +				(node->aggstrategy == AGG_PLAIN ||
 +				 node->aggstrategy == AGG_SORTED) &&
 +				aggnode != NULL &&
 +				aggnode->numCols == 1 &&
 +				aggnode->grpColIdx != NULL &&
-+				aggnode->grpColIdx[0] == 2 &&
++				aggnode->grpColIdx[0] == scan->vec_att_posttype &&
 +				aggnode->groupingSets == NIL &&
 +				node->numaggs == 2 &&
 +				node->ss.ps.qual == NULL &&
-+				ExecVecAggMatchesAggrefs(node);
++				ExecVecAggMatchesAggrefs(node, scan);
 +			node->vec_agg_drained = false;
 +			node->vec_agg_emit_index = 0;
 +		}

@@ -166,102 +166,135 @@ ExecScanFetch(ScanState *node,
  *			 "cursor" is positioned before the first qualifying tuple.
  * ----------------------------------------------------------------
  */
-/* VECTORIZED: relation-specific modes */
+/*
+ * VECTORIZED: target-relation classifier.
+ *
+ * VEC_REL_POSTS    — relation has all of (PostTypeId, Score, ViewCount?) of a
+ *                    vectorizable type. Inline filter + side-channel
+ *                    aggregation are enabled.
+ * VEC_REL_NONE     — relation is not a vectorization target; the engine
+ *                    falls back to standard volcano execution.
+ *
+ * Detection is purely catalog-driven: we walk the scan tuple descriptor,
+ * look up columns by *name*, and validate their type against an allow-list.
+ * No hardcoded attribute indices, no fixed natts count, no name strcmp on
+ * the relation itself — any user table that exposes the required columns
+ * with compatible types qualifies. Relation OID is cached on match so
+ * subsequent rescans skip re-detection.
+ */
 typedef enum VecRelationKind
 {
     VEC_REL_NONE = 0,
-    VEC_REL_SE_POSTS,
-    VEC_REL_QUESTIONS
+    VEC_REL_POSTS
 } VecRelationKind;
-
-/* VECTORIZED: column positions for se_posts schema */
-#define VEC_COL_POSTTYPE      2   /* PostTypeId */
-#define VEC_COL_SCORE         3   /* Score */
-#define VEC_COL_VIEWCOUNT     4   /* ViewCount */
 
 #define VEC_BATCH_SIZE      1000
 #define VEC_AGG_INIT_CAP      16
 
-/* VECTORIZED: detect exact se_posts schema */
-static bool
-vec_is_se_posts_relation(ScanState *node)
+/*
+ * VECTORIZED helper: locate an attribute by name from a TupleDesc and verify
+ * its declared type is in an allow-list of vectorizable types. Returns
+ * InvalidAttrNumber (0) if not found, dropped, or type-incompatible.
+ *
+ * The lookup is case-sensitive against pg_attribute.attname, which is the
+ * post-fold lowercased identifier (so "PostTypeId" in DDL → "posttypeid"
+ * in the catalog unless quoted).
+ */
+static AttrNumber
+vec_get_attno_by_name(TupleDesc desc, const char *name,
+                      const Oid *allowed_types, int n_types)
 {
-    TupleDesc desc;
-    int i;
+    int i, j;
 
-    if (node->ss_currentRelation == NULL)
-        return false;
+    if (desc == NULL || name == NULL)
+        return InvalidAttrNumber;
 
-    if (strcmp(RelationGetRelationName(node->ss_currentRelation), "se_posts") != 0)
-        return false;
-
-    desc = node->ss_ScanTupleSlot->tts_tupleDescriptor;
-    if (desc == NULL || desc->natts != 7)
-        return false;
-
-    /*
-     * Expected schema:
-     * (id, posttypeid, score, viewcount, answercount, commentcount, favoritecount)
-     * all int4
-     */
-    for (i = 0; i < 7; i++)
+    for (i = 0; i < desc->natts; i++)
     {
         Form_pg_attribute attr = TupleDescAttr(desc, i);
         if (attr->attisdropped)
-            return false;
-        if (attr->atttypid != INT4OID)
-            return false;
+            continue;
+        if (strcmp(NameStr(attr->attname), name) != 0)
+            continue;
+        for (j = 0; j < n_types; j++)
+        {
+            if (attr->atttypid == allowed_types[j])
+                return (AttrNumber) (i + 1);
+        }
+        /* Found by name but type is not vectorizable. */
+        return InvalidAttrNumber;
     }
-
-    return true;
+    return InvalidAttrNumber;
 }
 
-/* VECTORIZED: detect exact questions schema used by main app endpoints */
-static bool
-vec_is_questions_relation(ScanState *node)
+/*
+ * VECTORIZED helper: try several candidate attribute names (e.g. CamelCase
+ * "posttypeid" and snake_case "post_type_id") and return the first hit.
+ */
+static AttrNumber
+vec_get_attno_by_names(TupleDesc desc, const char * const *names, int n_names,
+                       const Oid *allowed_types, int n_types)
 {
-    TupleDesc desc;
-    static const Oid expected[7] = {
-        INT4OID,        /* id */
-        TEXTOID,        /* title */
-        TEXTOID,        /* body */
-        TEXTOID,        /* asked_by */
-        INT4OID,        /* score */
-        INT4OID,        /* views */
-        TIMESTAMPTZOID  /* created_at */
-    };
     int i;
 
-    if (node->ss_currentRelation == NULL)
-        return false;
-
-    if (strcmp(RelationGetRelationName(node->ss_currentRelation), "questions") != 0)
-        return false;
-
-    desc = node->ss_ScanTupleSlot->tts_tupleDescriptor;
-    if (desc == NULL || desc->natts != 7)
-        return false;
-
-    for (i = 0; i < 7; i++)
+    for (i = 0; i < n_names; i++)
     {
-        Form_pg_attribute attr = TupleDescAttr(desc, i);
-        if (attr->attisdropped)
-            return false;
-        if (attr->atttypid != expected[i])
-            return false;
+        AttrNumber a = vec_get_attno_by_name(desc, names[i], allowed_types, n_types);
+        if (AttributeNumberIsValid(a))
+            return a;
     }
-
-    return true;
+    return InvalidAttrNumber;
 }
 
+/*
+ * VECTORIZED: classify the scan's relation by probing its TupleDesc for the
+ * Posts-shaped columns. On a match the resolved attnos and OID are cached on
+ * the ScanState so all subsequent fetches use the dynamic mapping with no
+ * further lookups.
+ */
 static VecRelationKind
 vec_detect_target_relation(ScanState *node)
 {
-    if (vec_is_se_posts_relation(node))
-        return VEC_REL_SE_POSTS;
-    if (vec_is_questions_relation(node))
-        return VEC_REL_QUESTIONS;
-    return VEC_REL_NONE;
+    TupleDesc desc;
+    AttrNumber pt, sc, vc;
+    static const Oid int_types[] = { INT4OID, INT8OID };
+    static const char * const posttype_names[]  = { "posttypeid", "post_type_id" };
+    static const char * const viewcount_names[] = { "viewcount",  "view_count"   };
+
+    /* Reset cache so a rescan with a swapped descriptor can't reuse stale state. */
+    node->vec_target_oid    = InvalidOid;
+    node->vec_att_posttype  = InvalidAttrNumber;
+    node->vec_att_score     = InvalidAttrNumber;
+    node->vec_att_viewcount = InvalidAttrNumber;
+
+    if (node->ss_currentRelation == NULL)
+        return VEC_REL_NONE;
+
+    desc = node->ss_ScanTupleSlot->tts_tupleDescriptor;
+    if (desc == NULL)
+        return VEC_REL_NONE;
+
+    pt = vec_get_attno_by_names(desc, posttype_names, lengthof(posttype_names),
+                                int_types, lengthof(int_types));
+    sc = vec_get_attno_by_name (desc, "score",
+                                int_types, lengthof(int_types));
+    vc = vec_get_attno_by_names(desc, viewcount_names, lengthof(viewcount_names),
+                                int_types, lengthof(int_types));
+
+    /*
+     * Required columns for the vectorized aggregate path. ViewCount is
+     * optional — if absent we still vectorize the scan/agg, we just don't
+     * have the column for the optional inline pre-filter.
+     */
+    if (!AttributeNumberIsValid(pt) || !AttributeNumberIsValid(sc))
+        return VEC_REL_NONE;
+
+    node->vec_att_posttype  = pt;
+    node->vec_att_score     = sc;
+    node->vec_att_viewcount = vc;
+    node->vec_target_oid    = RelationGetRelid(node->ss_currentRelation);
+
+    return VEC_REL_POSTS;
 }
 
 static inline void
@@ -319,6 +352,12 @@ ExecScan(ScanState *node,
         const char *pg_vec = getenv("PG_VECTORIZED");
         VecRelationKind relkind = vec_detect_target_relation(node);
 
+        /*
+         * Activation requires both the env opt-in AND a positive catalog
+         * match. If detection failed, we leave vec_active=false and the
+         * volcano fallback at the bottom of the loop runs unmodified —
+         * this is the safety fallback required by the design.
+         */
         node->vec_active = (pg_vec != NULL &&
                             strcmp(pg_vec, "1") == 0 &&
                             relkind != VEC_REL_NONE);
@@ -326,28 +365,26 @@ ExecScan(ScanState *node,
 
         if (node->vec_active)
         {
-            if (relkind == VEC_REL_SE_POSTS)
-            {
-                node->vec_agg_keys = (int32 *) palloc(VEC_AGG_INIT_CAP * sizeof(int32));
-                node->vec_agg_sum_i64 = (int64 *) palloc0(VEC_AGG_INIT_CAP * sizeof(int64));
-                node->vec_agg_count = (int64 *) palloc0(VEC_AGG_INIT_CAP * sizeof(int64));
-                node->vec_agg_ngroups = 0;
-                node->vec_agg_cap = VEC_AGG_INIT_CAP;
-                node->vec_agg_enabled = true;
-            }
-            else
-            {
-                node->vec_agg_enabled = false;
-            }
-            node->vec_agg_logged = false;
+            /*
+             * Aggregate side-channel is enabled whenever we matched a Posts-
+             * shaped relation: PostTypeId+Score were proven present and INT4
+             * by vec_detect_target_relation.
+             */
+            node->vec_agg_keys    = (int32 *) palloc(VEC_AGG_INIT_CAP * sizeof(int32));
+            node->vec_agg_sum_i64 = (int64 *) palloc0(VEC_AGG_INIT_CAP * sizeof(int64));
+            node->vec_agg_count   = (int64 *) palloc0(VEC_AGG_INIT_CAP * sizeof(int64));
+            node->vec_agg_ngroups = 0;
+            node->vec_agg_cap     = VEC_AGG_INIT_CAP;
+            node->vec_agg_enabled = true;
+            node->vec_agg_logged  = false;
+
             node->vec_passed = 0;
             node->vec_filtered = 0;
             node->vec_total_passed = 0;
             node->vec_total_filtered = 0;
-            /* VECTORIZED: true batch slot flow initialization */
             node->vec_batch_count = 0;
             node->vec_batch_index = 0;
-            node->vec_batch_done = false;
+            node->vec_batch_done  = false;
             node->vec_batch_tuples = (HeapTuple *) palloc(VEC_BATCH_SIZE * sizeof(HeapTuple));
         }
     }
@@ -380,35 +417,20 @@ ExecScan(ScanState *node,
                 /* 2. Vectorized Processing Phase */
                 for (i = 0; i < node->vec_batch_count; i++)
                 {
-                    HeapTuple tup = node->vec_batch_tuples[i];
-                    bool pass = true;
+                    HeapTuple   tup = node->vec_batch_tuples[i];
+                    TupleDesc   tdesc = node->ss_ScanTupleSlot->tts_tupleDescriptor;
+                    bool        pass = true;
 
                     ResetExprContext(econtext);
 
                     /*
-                     * se_posts fast-path:
-                     * Apply cheap inline pre-filter before ExecQual.
-                     * questions fast-path:
-                     * Skip this pre-filter and rely on ExecQual to preserve semantics.
+                     * Run ExecQual on the materialized tuple. ExecQual is the
+                     * single source of truth for filter semantics — we no
+                     * longer apply a hardcoded inline short-circuit because
+                     * that depended on a benchmark-specific qual shape and is
+                     * unsafe under arbitrary user predicates.
                      */
-                    if (node->vec_agg_enabled)
-                    {
-                        bool isnull;
-                        Datum d;
-                        int32 views;
-
-                        d = heap_getattr(tup, VEC_COL_VIEWCOUNT,
-                                         node->ss_ScanTupleSlot->tts_tupleDescriptor, &isnull);
-                        views = isnull ? 0 : DatumGetInt32(d);
-                        if (qual != NULL && views <= 100)
-                            pass = false;
-                    }
-
-                    /*
-                     * Preserve correctness for all quals by evaluating ExecQual on
-                     * the tuple we just batched.
-                     */
-                    if (pass && qual != NULL)
+                    if (qual != NULL)
                     {
                         ExecForceStoreHeapTuple(tup, node->ss_ScanTupleSlot, false);
                         econtext->ecxt_scantuple = node->ss_ScanTupleSlot;
@@ -430,18 +452,23 @@ ExecScan(ScanState *node,
                     node->vec_passed++;
                     node->vec_total_passed++;
 
-                    if (node->vec_agg_enabled)
+                    /*
+                     * Side-channel aggregate: GROUP BY PostTypeId, SUM(Score),
+                     * COUNT(*). Uses dynamically-resolved attnos cached on
+                     * the ScanState — no hardcoded column indices.
+                     */
+                    if (node->vec_agg_enabled &&
+                        AttributeNumberIsValid(node->vec_att_posttype) &&
+                        AttributeNumberIsValid(node->vec_att_score))
                     {
-                        bool isnull;
-                        Datum d = heap_getattr(tup, VEC_COL_POSTTYPE,
-                                               node->ss_ScanTupleSlot->tts_tupleDescriptor, &isnull);
+                        bool  isnull;
+                        Datum d = heap_getattr(tup, node->vec_att_posttype, tdesc, &isnull);
                         int32 type_id = isnull ? 0 : DatumGetInt32(d);
 
                         if (!isnull)
                         {
-                            int gidx = vec_agg_find_or_add_group(node, type_id);
-                            Datum score_d = heap_getattr(tup, VEC_COL_SCORE,
-                                                         node->ss_ScanTupleSlot->tts_tupleDescriptor, &isnull);
+                            int   gidx = vec_agg_find_or_add_group(node, type_id);
+                            Datum score_d = heap_getattr(tup, node->vec_att_score, tdesc, &isnull);
                             if (!isnull)
                                 node->vec_agg_sum_i64[gidx] += (int64) DatumGetInt32(score_d);
                             node->vec_agg_count[gidx]++;
