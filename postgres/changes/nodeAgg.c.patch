@@ -11,8 +11,8 @@ index 2d9f37d..8e2f4a1 100644
  #include "executor/executor.h"
  #include "executor/nodeAgg.h"
 +#include "utils/lsyscache.h"
-@@ -317,6 +318,144 @@ static void hashagg_spill_finish(AggState *aggstate, HashAggSpill *spill,
- 							 int setno, int setoff, int *numGroups);
+@@ -317,6 +318,178 @@ static void hashagg_spill_finish(AggState *aggstate, HashAggSpill *spill,
+ 						 int setno, int setoff, int *numGroups);
  static void initialize_phase(AggState *aggstate, int newphase);
  
 +/*
@@ -77,21 +77,29 @@ index 2d9f37d..8e2f4a1 100644
 +ExecVecAgg(AggState *aggstate)
 +{
 +	PlanState	  *outer;
++	Agg		  *aggnode;
 +	ScanState	  *scan;
++	ExprContext  *econtext;
++	ProjectionInfo *projInfo;
++	TupleTableSlot *outer_slot;
 +	TupleTableSlot *result;
-+	int			   g;
++	int		   g;
++	int		   grp_attno;
 +
 +	outer = outerPlanState(aggstate);
 +	if (outer == NULL || !IsA(outer, ScanState))
 +		return NULL;
 +
++	aggnode = castNode(Agg, aggstate->ss.ps.plan);
 +	scan = (ScanState *) outer;
++	econtext = aggstate->ss.ps.ps_ExprContext;
++	projInfo = aggstate->ss.ps.ps_ProjInfo;
 +
 +	/*
 +	 * Safety guards:
 +	 * - only simple, non-split agg (no partial/final parallel state)
 +	 * - only plain/sorted strategy (not hash/mixed)
-+	 * - require scan-side arrays and expected output shape (3 cols)
++	 * - require scan-side arrays and projection context
 +	 */
 +	if (!scan->vec_active || !scan->vec_agg_enabled ||
 +		scan->vec_agg_keys == NULL ||
@@ -100,10 +108,24 @@ index 2d9f37d..8e2f4a1 100644
 +		aggstate->aggsplit != AGGSPLIT_SIMPLE ||
 +		(aggstate->aggstrategy != AGG_PLAIN &&
 +		 aggstate->aggstrategy != AGG_SORTED) ||
-+		aggstate->ss.ss_ScanTupleSlot->tts_tupleDescriptor == NULL ||
-+		aggstate->ss.ss_ScanTupleSlot->tts_tupleDescriptor->natts != 3 ||
++		econtext == NULL ||
++		projInfo == NULL ||
++		projInfo->pi_state.resultslot == NULL ||
++		aggnode == NULL ||
 +		aggstate->ss.ps.qual != NULL ||
 +		!ExecVecAggMatchesAggrefs(aggstate))
++		return NULL;
++
++	grp_attno = aggnode->grpColIdx[0];
++	if (grp_attno <= 0)
++		return NULL;
++
++	outer_slot = econtext->ecxt_outertuple;
++	if (outer_slot == NULL)
++		outer_slot = aggstate->ss.ps.ps_OuterTupleSlot;
++	if (outer_slot == NULL)
++		outer_slot = aggstate->ss.ss_ScanTupleSlot;
++	if (outer_slot == NULL || outer_slot->tts_tupleDescriptor == NULL)
 +		return NULL;
 +
 +	/* Drain the outer scan once so vector side-channel stats are finalized. */
@@ -127,35 +149,52 @@ index 2d9f37d..8e2f4a1 100644
 +		if (scan->vec_agg_count[g] == 0)
 +			continue;
 +
-+		/* Build output tuple directly to avoid slot/index/projection mismatch. */
-+		result = aggstate->ss.ss_ScanTupleSlot;
-+		ExecClearTuple(result);
++		/*
++		 * Populate aggregate values for ExecProject and set the grouping
++		 * key into the outer tuple slot (input TupleDesc).
++		 */
++		MemSet(econtext->ecxt_aggvalues, 0, aggstate->numaggs * sizeof(Datum));
++		MemSet(econtext->ecxt_aggnulls, true, aggstate->numaggs * sizeof(bool));
 +
-+		/* GROUP BY key: PostTypeId */
-+		result->tts_values[0] = Int32GetDatum(scan->vec_agg_keys[g]);
-+		result->tts_isnull[0] = false;
-+
-+		/* AVG(score): exact numeric(sum_i64) / numeric(count_i64). */
 +		{
 +			Datum avg_sum_numeric = DirectFunctionCall1(int8_numeric, Int64GetDatum(scan->vec_agg_sum_i64[g]));
 +			Datum avg_count_numeric = DirectFunctionCall1(int8_numeric, Int64GetDatum(scan->vec_agg_count[g]));
-+			result->tts_values[1] = DirectFunctionCall2(numeric_div, avg_sum_numeric, avg_count_numeric);
++			Datum avg_val = DirectFunctionCall2(numeric_div, avg_sum_numeric, avg_count_numeric);
++			Datum count_val = Int64GetDatum(scan->vec_agg_count[g]);
++			ListCell *lc;
++
++			foreach(lc, aggstate->aggs)
++			{
++				Aggref *aggref = lfirst_node(Aggref, lc);
++				int aggno = aggref->aggno;
++
++				if (aggno < 0 || aggno >= aggstate->numaggs)
++					return NULL;
++
++				if (aggref->aggstar)
++					econtext->ecxt_aggvalues[aggno] = count_val;
++				else
++					econtext->ecxt_aggvalues[aggno] = avg_val;
++				econtext->ecxt_aggnulls[aggno] = false;
++			}
 +		}
-+		result->tts_isnull[1] = false;
 +
-+		/* COUNT(*) */
-+		result->tts_values[2] = Int64GetDatum(scan->vec_agg_count[g]);
-+		result->tts_isnull[2] = false;
++		ExecClearTuple(outer_slot);
++		MemSet(outer_slot->tts_values, 0, outer_slot->tts_tupleDescriptor->natts * sizeof(Datum));
++		MemSet(outer_slot->tts_isnull, true, outer_slot->tts_tupleDescriptor->natts * sizeof(bool));
++		outer_slot->tts_values[grp_attno - 1] = Int32GetDatum(scan->vec_agg_keys[g]);
++		outer_slot->tts_isnull[grp_attno - 1] = false;
++		ExecStoreVirtualTuple(outer_slot);
 +
-+		ExecStoreVirtualTuple(result);
++		econtext->ecxt_outertuple = outer_slot;
++		econtext->ecxt_scantuple = outer_slot;
++
++		result = ExecProject(projInfo);
 +		return result;
 +	}
 +}
 +
 +
- /* ----------------------------------------------------------------
-  *      ExecAgg
-  *
 @@ -333,6 +393,40 @@ ExecAgg(PlanState *pstate)
  {
  	AggState   *node = castNode(AggState, pstate);

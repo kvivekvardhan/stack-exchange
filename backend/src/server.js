@@ -31,6 +31,30 @@ function isInspectorEnabled(req) {
 
 const recentViewEvents = new Map();
 const VIEW_DEBOUNCE_MS = 4000;
+const INSPECT_TIMEOUT_MS = Number.parseInt(process.env.INSPECT_TIMEOUT_MS || "3000", 10);
+const INSPECT_TIMEOUT = Number.isFinite(INSPECT_TIMEOUT_MS) ? INSPECT_TIMEOUT_MS : 3000;
+
+function normalizeInspectSql(raw) {
+  const trimmed = String(raw || "").trim();
+  if (!trimmed) {
+    return { error: "SQL query is required" };
+  }
+
+  if (!/^\s*(SELECT|WITH)\b/i.test(trimmed)) {
+    return { error: "Only SELECT or WITH queries are allowed" };
+  }
+
+  const withoutTrailing = trimmed.replace(/;\s*$/, "");
+  if (withoutTrailing.includes(";")) {
+    return { error: "Multiple statements are not allowed" };
+  }
+
+  if (/--|\/\*/.test(withoutTrailing)) {
+    return { error: "SQL comments are not allowed" };
+  }
+
+  return { sql: withoutTrailing };
+}
 
 function asyncHandler(handler) {
   return (req, res, next) => {
@@ -837,63 +861,65 @@ app.get(
 app.post(
   "/inspect",
   asyncHandler(async (req, res) => {
-    const sql = String(req.body?.sql || "").trim();
-
-    if (!sql) {
-      return badRequest(res, "SQL query is required");
+    const normalized = normalizeInspectSql(req.body?.sql);
+    if (normalized.error) {
+      return badRequest(res, normalized.error);
     }
-
-    // Safety: only allow SELECT statements
-    if (!/^\s*SELECT\b/i.test(sql)) {
-      return badRequest(res, "Only SELECT queries are allowed");
-    }
+    const sql = normalized.sql;
 
     async function inspectEngine(engine) {
-      const start = process.hrtime.bigint();
-      let result, error = null;
-      try {
-        result = await queryWithEngine(engine, sql, []);
-      } catch (err) {
-        error = err.message;
-        result = null;
-      }
-      const execMs = Number(hrtimeToMs(start).toFixed(3));
+      return withTransactionEngine(engine, async (client) => {
+        await client.query("SET TRANSACTION READ ONLY");
+        await client.query("SET LOCAL statement_timeout = $1", [`${INSPECT_TIMEOUT}ms`]);
 
-      let plan = null, planJson = null;
-      try {
-        const explainText = await queryWithEngine(
+        const start = process.hrtime.bigint();
+        let result, error = null;
+        try {
+          result = await client.query(sql, []);
+        } catch (err) {
+          error = err.message;
+          result = null;
+        }
+        const execMs = Number(hrtimeToMs(start).toFixed(3));
+
+        let plan = null;
+        let planJson = null;
+
+        if (!error) {
+          try {
+            const explainText = await client.query(
+              `EXPLAIN (ANALYZE, FORMAT TEXT) ${sql}`,
+              []
+            );
+            plan = explainText.rows.map((r) => r["QUERY PLAN"]).join("\n");
+          } catch (_) {}
+
+          try {
+            const explainJson = await client.query(
+              `EXPLAIN (ANALYZE, FORMAT JSON) ${sql}`,
+              []
+            );
+            planJson = explainJson.rows[0]["QUERY PLAN"];
+          } catch (_) {}
+        }
+
+        // Parse vectorized scan info from plan text
+        const isVectorized = plan ? plan.includes("Vectorized Seq Scan") : false;
+        const rowsMatch = plan ? plan.match(/rows=(\d+)/) : null;
+        const filterMatch = plan ? plan.match(/Rows Removed by Filter:\s*(\d+)/) : null;
+
+        return {
           engine,
-          `EXPLAIN (ANALYZE, FORMAT TEXT) ${sql}`,
-          []
-        );
-        plan = explainText.rows.map((r) => r["QUERY PLAN"]).join("\n");
-      } catch (_) {}
-
-      try {
-        const explainJson = await queryWithEngine(
-          engine,
-          `EXPLAIN (ANALYZE, FORMAT JSON) ${sql}`,
-          []
-        );
-        planJson = explainJson.rows[0]["QUERY PLAN"];
-      } catch (_) {}
-
-      // Parse vectorized scan info from plan text
-      const isVectorized = plan ? plan.includes("Vectorized Seq Scan") : false;
-      const rowsMatch = plan ? plan.match(/rows=(\d+)/) : null;
-      const filterMatch = plan ? plan.match(/Rows Removed by Filter:\s*(\d+)/) : null;
-
-      return {
-        engine,
-        execMs,
-        rowCount: result ? result.rowCount : 0,
-        error,
-        plan,
-        planJson,
-        isVectorized,
-        estimatedRows: rowsMatch ? parseInt(rowsMatch[1], 10) : null,
-        filteredRows: filterMatch ? parseInt(filterMatch[1], 10) : null
-      };
+          execMs,
+          rowCount: result ? result.rowCount : 0,
+          error,
+          plan,
+          planJson,
+          isVectorized,
+          estimatedRows: rowsMatch ? parseInt(rowsMatch[1], 10) : null,
+          filteredRows: filterMatch ? parseInt(filterMatch[1], 10) : null
+        };
+      });
     }
 
     const [baseline, vectorized] = await Promise.all([
