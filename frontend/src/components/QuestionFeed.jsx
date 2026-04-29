@@ -86,18 +86,25 @@ export default function QuestionFeed({
 
   useEffect(() => {
     let active = true;
+    const controller = new AbortController();
 
     async function fetchResults() {
       setLoading(true);
       setError("");
 
       try {
-        const response = await searchQuestions({ q: urlQ.trim(), tag: urlTag.trim() });
+        const response = await searchQuestions(
+          { q: urlQ.trim(), tag: urlTag.trim() },
+          { signal: controller.signal }
+        );
         if (active) {
           setResults(response.data);
           setMeta(response.meta || null);
         }
       } catch (requestError) {
+        if (requestError?.name === "AbortError") {
+          return;
+        }
         if (active) {
           setError(requestError.message);
           setResults([]);
@@ -114,6 +121,7 @@ export default function QuestionFeed({
 
     return () => {
       active = false;
+      controller.abort();
     };
   }, [urlQ, urlTag]);
 

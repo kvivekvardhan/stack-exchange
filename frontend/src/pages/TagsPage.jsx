@@ -13,17 +13,21 @@ export default function TagsPage() {
 
   useEffect(() => {
     let active = true;
+    const controller = new AbortController();
 
     async function loadTags() {
       setLoading(true);
       setError("");
       try {
-        const response = await getTags({ q: query.trim() });
+        const response = await getTags({ q: query.trim() }, { signal: controller.signal });
         if (active) {
           setTags(response.data);
           setMeta(response.meta || null);
         }
       } catch (requestError) {
+        if (requestError?.name === "AbortError") {
+          return;
+        }
         if (active) {
           setError(requestError.message);
           setTags([]);
@@ -40,6 +44,7 @@ export default function TagsPage() {
 
     return () => {
       active = false;
+      controller.abort();
     };
   }, [query]);
 

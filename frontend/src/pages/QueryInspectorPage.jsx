@@ -1,11 +1,11 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { inspectQuery } from "../api";
 
 const EXAMPLE_QUERIES = [
-  "SELECT AVG(fare_amount) FROM taxi_trips WHERE trip_distance > 5",
-  "SELECT passenger_count, AVG(fare_amount), COUNT(*) FROM taxi_trips WHERE trip_distance > 5 GROUP BY passenger_count",
-  "SELECT passenger_count, AVG(fare_amount) FROM taxi_trips WHERE trip_distance BETWEEN 2 AND 8 GROUP BY passenger_count",
-  "SELECT passenger_count, COUNT(*) FROM taxi_trips GROUP BY passenger_count"
+  "SELECT COUNT(*) FROM se_posts WHERE ViewCount > 100",
+  "SELECT PostTypeId, AVG(Score) FROM se_posts WHERE ViewCount > 100 GROUP BY PostTypeId",
+  "SELECT PostTypeId, AVG(Score), COUNT(*) FROM se_posts WHERE ViewCount > 500 GROUP BY PostTypeId",
+  "SELECT AVG(Score) FROM se_posts WHERE ViewCount > 1000"
 ];
 
 function PlanNode({ line, index }) {
@@ -59,20 +59,46 @@ export default function QueryInspectorPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
+  const abortRef = useRef(null);
+
+  useEffect(() => {
+    return () => {
+      if (abortRef.current) {
+        abortRef.current.abort();
+      }
+    };
+  }, []);
 
   async function handleRun(e) {
     e.preventDefault();
     if (!sql.trim()) return;
+    if (abortRef.current) {
+      abortRef.current.abort();
+    }
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setLoading(true);
     setError("");
     try {
-      const response = await inspectQuery(sql.trim());
+      const response = await inspectQuery(sql.trim(), { signal: controller.signal });
+      if (abortRef.current !== controller) {
+        return;
+      }
       setResult(response);
     } catch (err) {
+      if (err?.name === "AbortError") {
+        return;
+      }
+      if (abortRef.current !== controller) {
+        return;
+      }
       setError(err.message);
       setResult(null);
     } finally {
-      setLoading(false);
+      if (abortRef.current === controller) {
+        setLoading(false);
+      }
     }
   }
 

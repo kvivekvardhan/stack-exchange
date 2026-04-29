@@ -4,7 +4,7 @@ This folder contains our modifications to PostgreSQL 15.17 that implement vector
 
 ## What We Changed
 
-We modified 4 files in the PostgreSQL 15.17 source tree:
+We modified 5 files in the PostgreSQL 15.17 source tree:
 
 | File | Location in PG source | What we changed |
 |---|---|---|
@@ -20,15 +20,14 @@ We modified 4 files in the PostgreSQL 15.17 source tree:
 
 We added a prototype aggregate tracker inside the vectorized scan path and a
 nodeAgg patch that can emit group results directly from the scan state. It
-collects `SUM(fare_amount)` and `COUNT(*)` by `passenger_count` while the
-vectorized filter runs, then emits `passenger_count`, `AVG(fare_amount)`, and
-`COUNT(*)` from the Agg node when the scan completes.
+collects `SUM(score)` and `COUNT(*)` by `PostTypeId` while the vectorized
+filter runs, then emits `PostTypeId`, `AVG(score)`, and `COUNT(*)` from the
+Agg node when the scan completes.
 
 Limitations:
-- Hardcoded to `taxi_trips` column positions (passenger_count, trip_distance,
-  fare_amount).
-- Assumes `passenger_count` in the range 1..7.
-- Hardcoded output shape: `passenger_count`, `AVG(fare_amount)`, `COUNT(*)`.
+- Hardcoded to `se_posts` integer-column schema used in our benchmark.
+- Assumes `PostTypeId` values in the range 1..7.
+- Hardcoded output shape: `PostTypeId`, `AVG(score)`, `COUNT(*)`.
 - Bypasses normal Agg processing for this shape only.
 
 ---

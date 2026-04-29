@@ -299,6 +299,10 @@ app.get(
     const inspect = isInspectorEnabled(req);
     const q = String(req.query.q || "").trim().toLowerCase();
     const tag = String(req.query.tag || "").trim().toLowerCase();
+    const minViewsRaw = String(req.query.minViews || "").trim();
+    const minViewsParsed = Number.parseInt(minViewsRaw, 10);
+    const minViews =
+      Number.isFinite(minViewsParsed) && minViewsParsed >= 0 ? minViewsParsed : 0;
 
     const searchSql = `
       SELECT
@@ -328,10 +332,11 @@ app.get(
               AND LOWER(tf.name) LIKE '%' || $2 || '%'
           )
         )
+        AND q.views >= $3
       GROUP BY q.id, answer_counts.answer_count
       ORDER BY q.score DESC, q.created_at DESC
     `;
-    const searchResult = await runQuery(engine, searchSql, [q, tag], { inspect });
+    const searchResult = await runQuery(engine, searchSql, [q, tag, minViews], { inspect });
 
     const responseRows = searchResult.result.rows.map(mapSearchQuestion);
     const timingMs = searchResult.timingMs;
@@ -340,14 +345,14 @@ app.get(
       meta: {
         timingMs,
         resultCount: responseRows.length,
-        query: { q, tag },
+        query: { q, tag, minViews },
         engine,
         inspector: inspect
           ? [
               {
                 name: "search",
                 sql: searchSql.trim(),
-                params: [q, tag],
+                params: [q, tag, minViews],
                 plan: searchResult.plan
               }
             ]

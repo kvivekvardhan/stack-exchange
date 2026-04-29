@@ -16,7 +16,7 @@ The script reads the following environment variables:
 
 - DB_NAME (default: postgres)
 - DB_HOST (default: 127.0.0.1)
-- BASELINE_PORT (default: 5432)
+- BASELINE_PORT (default: 5434)
 - VECTORIZED_PORT (default: 5433)
 - OUT_DIR (default: postgres/benchmarks)
 - OUT_FILE (default: postgres/benchmarks/results.md)
@@ -24,7 +24,7 @@ The script reads the following environment variables:
 Example:
 
 ```bash
-DB_NAME=postgres BASELINE_PORT=5432 VECTORIZED_PORT=5434 \
+DB_NAME=postgres BASELINE_PORT=5434 VECTORIZED_PORT=5433 \
   bash postgres/benchmarks/run_benchmark.sh
 ```
 

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   getQuestion,
@@ -88,20 +88,25 @@ export default function QuestionPage() {
   const [replyBody, setReplyBody] = useState("");
   const [postingReply, setPostingReply] = useState(false);
   const [replyModalAnswerId, setReplyModalAnswerId] = useState(null);
+  const mutationAbortRef = useRef(null);
 
   useEffect(() => {
     let active = true;
+    const controller = new AbortController();
 
     async function loadQuestion() {
       setLoading(true);
       setError("");
       try {
-        const response = await getQuestion(id);
+        const response = await getQuestion(id, { signal: controller.signal });
         if (active) {
           setQuestion(response.data);
           setMeta(response.meta || null);
         }
       } catch (requestError) {
+        if (requestError?.name === "AbortError") {
+          return;
+        }
         if (active) {
           setError(requestError.message);
           setMeta(null);
@@ -117,8 +122,26 @@ export default function QuestionPage() {
 
     return () => {
       active = false;
+      controller.abort();
     };
   }, [id]);
+
+  useEffect(() => {
+    return () => {
+      if (mutationAbortRef.current) {
+        mutationAbortRef.current.abort();
+      }
+    };
+  }, []);
+
+  function startMutationSignal() {
+    if (mutationAbortRef.current) {
+      mutationAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    mutationAbortRef.current = controller;
+    return controller;
+  }
 
   async function handleQuestionUpvote() {
     if (!question || busy) {
@@ -126,10 +149,14 @@ export default function QuestionPage() {
     }
     setBusy(true);
     setActionError("");
+    const controller = startMutationSignal();
     try {
-      const response = await upvoteQuestion(question.id);
+      const response = await upvoteQuestion(question.id, { signal: controller.signal });
       setQuestion((prev) => (prev ? { ...prev, score: response.data.score } : prev));
     } catch (requestError) {
+      if (requestError?.name === "AbortError") {
+        return;
+      }
       setActionError(requestError.message);
     } finally {
       setBusy(false);
@@ -144,16 +171,20 @@ export default function QuestionPage() {
 
     setPostingAnswer(true);
     setActionError("");
+    const controller = startMutationSignal();
     try {
       const response = await postAnswer(question.id, {
         author: answerAuthor,
         body: answerBody
-      });
+      }, { signal: controller.signal });
       setQuestion((prev) => (prev ? appendAnswer(prev, response.data) : prev));
       setAnswerAuthor("");
       setAnswerBody("");
       setAnswerModalOpen(false);
     } catch (requestError) {
+      if (requestError?.name === "AbortError") {
+        return;
+      }
       setActionError(requestError.message);
     } finally {
       setPostingAnswer(false);
@@ -166,10 +197,14 @@ export default function QuestionPage() {
     }
     setBusy(true);
     setActionError("");
+    const controller = startMutationSignal();
     try {
-      const response = await upvoteAnswer(question.id, answerId);
+      const response = await upvoteAnswer(question.id, answerId, { signal: controller.signal });
       setQuestion((prev) => (prev ? updateAnswerScore(prev, answerId, response.data.score) : prev));
     } catch (requestError) {
+      if (requestError?.name === "AbortError") {
+        return;
+      }
       setActionError(requestError.message);
     } finally {
       setBusy(false);
@@ -189,8 +224,14 @@ export default function QuestionPage() {
 
     setPostingReply(true);
     setActionError("");
+    const controller = startMutationSignal();
     try {
-      const response = await postReply(question.id, replyModalAnswerId, { body, author });
+      const response = await postReply(
+        question.id,
+        replyModalAnswerId,
+        { body, author },
+        { signal: controller.signal }
+      );
       setQuestion((prev) =>
         prev ? appendReplyToAnswer(prev, replyModalAnswerId, response.data) : prev
       );
@@ -198,6 +239,9 @@ export default function QuestionPage() {
       setReplyBody("");
       setReplyModalAnswerId(null);
     } catch (requestError) {
+      if (requestError?.name === "AbortError") {
+        return;
+      }
       setActionError(requestError.message);
     } finally {
       setPostingReply(false);
@@ -210,12 +254,18 @@ export default function QuestionPage() {
     }
     setBusy(true);
     setActionError("");
+    const controller = startMutationSignal();
     try {
-      const response = await upvoteReply(question.id, answerId, replyId);
+      const response = await upvoteReply(question.id, answerId, replyId, {
+        signal: controller.signal
+      });
       setQuestion((prev) =>
         prev ? updateReplyScore(prev, answerId, replyId, response.data.score) : prev
       );
     } catch (requestError) {
+      if (requestError?.name === "AbortError") {
+        return;
+      }
       setActionError(requestError.message);
     } finally {
       setBusy(false);

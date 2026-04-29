@@ -1472,16 +1472,16 @@ typedef struct ScanState
 
     /* VECTORIZED: streaming scan state */
     bool        vec_init;           /* true after first init */
-    bool        vec_active;         /* cached: PG_VECTORIZED=1 && natts==6 */
+    bool        vec_active;         /* cached: PG_VECTORIZED=1 && target relation/schema */
     int         vec_passed;         /* tuples passed filter in current window */
     int         vec_filtered;       /* tuples filtered in current window */
     int64       vec_total_passed;   /* total tuples passed across scan */
     int64       vec_total_filtered; /* total tuples filtered across scan */
 
-    /* VECTORIZED: multi-column aggregate state (passenger_count groups) */
-    float8     *vec_agg_sum;        /* sum(fare_amount) per group */
-    float8     *vec_agg_sum2;       /* sum(tip_amount) per group */
-    float8     *vec_agg_dist_sum;   /* sum(trip_distance) per group */
+    /* VECTORIZED: aggregate state (PostTypeId groups for se_posts) */
+    float8     *vec_agg_sum;        /* sum(score) per group */
+    float8     *vec_agg_sum2;       /* reserved for future aggregates */
+    float8     *vec_agg_dist_sum;   /* reserved for future aggregates */
     int64      *vec_agg_count;      /* count(*) per group */
     bool        vec_agg_enabled;    /* enable aggregate tracking */
     bool        vec_agg_logged;     /* aggregate results logged */

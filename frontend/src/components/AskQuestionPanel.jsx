@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { createQuestion } from "../api";
 import Modal from "./Modal";
@@ -12,6 +12,15 @@ export default function AskQuestionPanel() {
   const [author, setAuthor] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState("");
+  const submitAbortRef = useRef(null);
+
+  useEffect(() => {
+    return () => {
+      if (submitAbortRef.current) {
+        submitAbortRef.current.abort();
+      }
+    };
+  }, []);
 
   function openModal() {
     setError("");
@@ -32,15 +41,26 @@ export default function AskQuestionPanel() {
 
     setIsSubmitting(true);
     setError("");
+    if (submitAbortRef.current) {
+      submitAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    submitAbortRef.current = controller;
 
     try {
-      const response = await createQuestion({ title, body, tags, author });
+      const response = await createQuestion(
+        { title, body, tags, author },
+        { signal: controller.signal }
+      );
       const newQuestionId = response?.data?.id;
       if (newQuestionId) {
         setIsModalOpen(false);
         navigate(`/question/${newQuestionId}`);
       }
     } catch (requestError) {
+      if (requestError?.name === "AbortError") {
+        return;
+      }
       setError(requestError.message);
     } finally {
       setIsSubmitting(false);

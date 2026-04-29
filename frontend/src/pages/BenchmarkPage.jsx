@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getBenchmark } from "../api";
 import QueryInspector from "../components/QueryInspector";
 
@@ -9,25 +9,48 @@ export default function BenchmarkPage() {
   const [error, setError] = useState("");
   const [benchmark, setBenchmark] = useState(null);
   const [meta, setMeta] = useState(null);
+  const abortRef = useRef(null);
 
   async function fetchBenchmark(params) {
+    if (abortRef.current) {
+      abortRef.current.abort();
+    }
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setLoading(true);
     setError("");
     try {
-      const response = await getBenchmark(params);
+      const response = await getBenchmark(params, { signal: controller.signal });
+      if (abortRef.current !== controller) {
+        return;
+      }
       setBenchmark(response.data);
       setMeta(response.meta || null);
     } catch (requestError) {
+      if (requestError?.name === "AbortError") {
+        return;
+      }
+      if (abortRef.current !== controller) {
+        return;
+      }
       setError(requestError.message);
       setBenchmark(null);
       setMeta(null);
     } finally {
-      setLoading(false);
+      if (abortRef.current === controller) {
+        setLoading(false);
+      }
     }
   }
 
   useEffect(() => {
     fetchBenchmark({ q: search, tag });
+    return () => {
+      if (abortRef.current) {
+        abortRef.current.abort();
+      }
+    };
   }, []);
 
   function handleSubmit(event) {

@@ -3,9 +3,9 @@ set -euo pipefail
 
 DB_NAME=${DB_NAME:-postgres}
 DB_HOST=${DB_HOST:-127.0.0.1}
-BASELINE_PORT=${BASELINE_PORT:-5432}
+BASELINE_PORT=${BASELINE_PORT:-5434}
 VECTORIZED_PORT=${VECTORIZED_PORT:-5433}
-OUT_DIR=${OUT_DIR:-/home/vivekvardhank/ACADS/DBIS/stack-exchange/postgres/benchmarks}
+OUT_DIR=${OUT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 OUT_FILE=${OUT_FILE:-$OUT_DIR/results.md}
 
 queries=(

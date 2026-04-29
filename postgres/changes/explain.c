@@ -1223,7 +1223,9 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			sname = "Hash Join";
 			break;
 		case T_SeqScan:
-			if (IsA(plan, SeqScan) && ((ScanState *) planstate)->vec_active)
+			if (planstate != NULL &&
+				IsA(plan, SeqScan) &&
+				((ScanState *) planstate)->vec_active)
 				pname = "Vectorized Seq Scan";
 			else
 				pname = "Seq Scan";

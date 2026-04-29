@@ -49,71 +49,77 @@ async function request(path, params = {}, options = {}) {
   return payload;
 }
 
-export function searchQuestions({ q, tag }) {
-  return request("/search", { q, tag });
+export function searchQuestions({ q, tag }, options = {}) {
+  return request("/search", { q, tag }, options);
 }
 
-export function getTags({ q } = {}) {
-  return request("/tags", { q });
+export function getTags({ q } = {}, options = {}) {
+  return request("/tags", { q }, options);
 }
 
-export function getBenchmark({ q, tag } = {}) {
-  return request("/benchmark", { q, tag });
+export function getBenchmark({ q, tag } = {}, options = {}) {
+  return request("/benchmark", { q, tag }, options);
 }
 
-export function getQuestion(id) {
-  return request(`/question/${id}`);
+export function getQuestion(id, options = {}) {
+  return request(`/question/${id}`, {}, options);
 }
 
-export function createQuestion({ title, body, tags, author }) {
+export function createQuestion({ title, body, tags, author }, options = {}) {
   return request(
     "/questions",
     {},
     {
+      ...options,
       method: "POST",
       body: { title, body, tags, author }
     }
   );
 }
 
-export function upvoteQuestion(id) {
-  return request(`/question/${id}/upvote`, {}, { method: "POST" });
+export function upvoteQuestion(id, options = {}) {
+  return request(`/question/${id}/upvote`, {}, { ...options, method: "POST" });
 }
 
-export function postAnswer(questionId, { body, author }) {
+export function postAnswer(questionId, { body, author }, options = {}) {
   return request(
     `/question/${questionId}/answers`,
     {},
     {
+      ...options,
       method: "POST",
       body: { body, author }
     }
   );
 }
 
-export function upvoteAnswer(questionId, answerId) {
-  return request(`/question/${questionId}/answers/${answerId}/upvote`, {}, { method: "POST" });
+export function upvoteAnswer(questionId, answerId, options = {}) {
+  return request(`/question/${questionId}/answers/${answerId}/upvote`, {}, {
+    ...options,
+    method: "POST"
+  });
 }
 
-export function postReply(questionId, answerId, { body, author }) {
+export function postReply(questionId, answerId, { body, author }, options = {}) {
   return request(
     `/question/${questionId}/answers/${answerId}/replies`,
     {},
     {
+      ...options,
       method: "POST",
       body: { body, author }
     }
   );
 }
 
-export function upvoteReply(questionId, answerId, replyId) {
+export function upvoteReply(questionId, answerId, replyId, options = {}) {
   return request(
     `/question/${questionId}/answers/${answerId}/replies/${replyId}/upvote`,
     {},
-    { method: "POST" }
+    { ...options, method: "POST" }
   );
 }
 
-export function inspectQuery(sql) {
-  return request("/inspect", {}, { method: "POST", body: { sql } });
+export function inspectQuery(sql, options = {}) {
+  return request("/inspect", {}, { method: "POST", body: { sql }, ...options });
 }

@@ -1,0 +1,116 @@
+diff --git a/src/backend/executor/nodeAgg.c b/src/backend/executor/nodeAgg.c
+index 2d9f37d..8e2f4a1 100644
+--- a/src/backend/executor/nodeAgg.c
++++ b/src/backend/executor/nodeAgg.c
+@@ -72,6 +72,7 @@
+ #include "postgres.h"
+ 
+ #include "access/htup_details.h"
++#include "executor/nodeSeqscan.h"
+ #include "executor/execdebug.h"
+ #include "executor/executor.h"
+ #include "executor/nodeAgg.h"
+@@ -317,6 +318,65 @@ static void hashagg_spill_finish(AggState *aggstate, HashAggSpill *spill,
+ 							 int setno, int setoff, int *numGroups);
+ static void initialize_phase(AggState *aggstate, int newphase);
+ 
++/*
++ * VECTORIZED: emit aggregate rows directly from ScanState side-channel arrays.
++ *
++ * Expected output shape:
++ *   (PostTypeId, AVG(Score), COUNT(*))
++ */
++static TupleTableSlot *
++ExecVecAgg(AggState *aggstate)
++{
++	PlanState	  *outer;
++	ScanState	  *scan;
++	ExprContext   *econtext;
++	int			   g;
++
++	outer = outerPlanState(aggstate);
++	if (outer == NULL || !IsA(outer, ScanState))
++		return NULL;
++
++	scan = (ScanState *) outer;
++	econtext = aggstate->ss.ps.ps_ExprContext;
++
++	/* Drain the outer scan once so vector side-channel stats are finalized. */
++	if (!aggstate->vec_agg_drained)
++	{
++		while (ExecProcNode(outer) != NULL)
++			;
++		aggstate->vec_agg_drained = true;
++		aggstate->vec_agg_emit_index = 1;
++	}
++
++	for (;;)
++	{
++		if (aggstate->vec_agg_emit_index >= 8)
++			return NULL;
++
++		g = aggstate->vec_agg_emit_index++;
++		if (scan->vec_agg_count[g] == 0)
++			continue;
++
++		/*
++		 * Fill precomputed aggregate values for projection targetlist:
++		 *   Agg value 1: AVG(score)
++		 *   Agg value 2: COUNT(*)
++		 */
++		econtext->ecxt_aggvalues[0] = Float8GetDatum(
++			scan->vec_agg_sum[g] / (double) scan->vec_agg_count[g]);
++		econtext->ecxt_aggnulls[0] = false;
++
++		econtext->ecxt_aggvalues[1] = Int64GetDatum(scan->vec_agg_count[g]);
++		econtext->ecxt_aggnulls[1] = false;
++
++		/* Group key value visible to projection. */
++		econtext->ecxt_outertuple->tts_values[1] = Int32GetDatum(g);
++		econtext->ecxt_outertuple->tts_isnull[1] = false;
++		ExecStoreVirtualTuple(econtext->ecxt_outertuple);
++
++		return ExecProject(aggstate->ss.ps.ps_ProjInfo);
++	}
++}
++
++
+ /* ----------------------------------------------------------------
+  *      ExecAgg
+  *
+@@ -333,6 +393,22 @@ ExecAgg(PlanState *pstate)
+ {
+ 	AggState   *node = castNode(AggState, pstate);
+ 
++	/*
++	 * VECTORIZED: detect scan-side aggregate passthrough mode once.
++	 */
++	if (!node->vec_agg_enabled)
++	{
++		PlanState *outer = outerPlanState(node);
++		if (outer && IsA(outer, ScanState))
++		{
++			ScanState *scan = (ScanState *) outer;
++			node->vec_agg_enabled = scan->vec_active && scan->vec_agg_enabled;
++			node->vec_agg_drained = false;
++			node->vec_agg_emit_index = 1;
++		}
++	}
++	if (node->vec_agg_enabled)
++		return ExecVecAgg(node);
++
+ 	CHECK_FOR_INTERRUPTS();
+ 
+ 	if (!node->agg_done)
+@@ -3360,6 +3436,11 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
+ 	aggstate->input_done = false;
+ 	aggstate->agg_done = false;
+ 	aggstate->projected_set = -1;
++
++	/* VECTORIZED aggregate passthrough state */
++	aggstate->vec_agg_enabled = false;
++	aggstate->vec_agg_drained = false;
++	aggstate->vec_agg_emit_index = 1;
+ 
+ 	aggstate->current_phase = 0;
+ 	aggstate->phase = NULL;
