@@ -1465,10 +1465,20 @@ typedef struct BitmapOrState
  */
 typedef struct ScanState
 {
-	PlanState	ps;				/* its first field is NodeTag */
-	Relation	ss_currentRelation;
-	struct TableScanDescData *ss_currentScanDesc;
-	TupleTableSlot *ss_ScanTupleSlot;
+    PlanState       ps;                         /* its first field is NodeTag */
+    Relation        ss_currentRelation;
+    struct TableScanDescData *ss_currentScanDesc;
+    TupleTableSlot *ss_ScanTupleSlot;
+
+    /* VECTORIZED: batch state */
+    HeapTuple  *vec_batch;      /* batch of copied tuples */
+    bool       *vec_qual;       /* qual result per tuple */
+    float8     *vec_col3;       /* trip_distance values */
+    float8     *vec_col4;       /* fare_amount values */
+    int         vec_size;       /* tuples filled in batch */
+    int         vec_index;      /* current read position */
+    bool        vec_done;       /* true when scan exhausted */
+    bool        vec_init;       /* true after first init */
 } ScanState;
 
 /* ----------------
@@ -1477,13 +1487,8 @@ typedef struct ScanState
  */
 typedef struct SeqScanState
 {
-	ScanState	ss;
-	Size		pscan_len;
-
-	/* VECTORIZED: batch tracking */
-	int			batch_count;	/* completed batches */
-	int			batch_index;	/* position within current batch */
-	bool		batch_done;
+    ScanState   ss;
+    Size        pscan_len;
 } SeqScanState;
 
 /* ----------------

@@ -108,28 +108,11 @@ SeqRecheck(SeqScanState *node, TupleTableSlot *slot)
 static TupleTableSlot *
 ExecSeqScan(PlanState *pstate)
 {
-	SeqScanState *node = castNode(SeqScanState, pstate);
-	TupleTableSlot *slot;
+    SeqScanState *node = castNode(SeqScanState, pstate);
 
-	slot = ExecScan(&node->ss,
-					(ExecScanAccessMtd) SeqNext,
-					(ExecScanRecheckMtd) SeqRecheck);
-
-	/* VECTORIZED: track rows in batches */
-	if (!TupIsNull(slot))
-	{
-		node->batch_index++;
-		if (node->batch_index >= VECTOR_BATCH_SIZE)
-		{
-			node->batch_count++;
-			node->batch_index = 0;
-			elog(LOG, "VECTORIZED: Batch %d complete, %d total rows processed",
-				 node->batch_count,
-				 node->batch_count * VECTOR_BATCH_SIZE);
-		}
-	}
-
-	return slot;
+    return ExecScan(&node->ss,
+                    (ExecScanAccessMtd) SeqNext,
+                    (ExecScanRecheckMtd) SeqRecheck);
 }
 
 /* ----------------------------------------------------------------
@@ -156,10 +139,12 @@ ExecInitSeqScan(SeqScan *node, EState *estate, int eflags)
 	scanstate->ss.ps.state = estate;
 	scanstate->ss.ps.ExecProcNode = ExecSeqScan;
 
-	/* VECTORIZED: initialize batch tracking */
-	scanstate->batch_count = 0;
-	scanstate->batch_index = 0;
-	scanstate->batch_done = false;
+	// /* VECTORIZED: initialize batch tracking */
+	// scanstate->batch_count = 0;
+	// scanstate->batch_index = 0;
+	// scanstate->batch_done = false;
+	// scanstate->batch_tuples = NULL;
+	// scanstate->total_rows = 0;
 
 	/*
 	 * Miscellaneous initialization
