@@ -23,6 +23,8 @@
 #include "miscadmin.h"
 #include "utils/memutils.h"
 
+#include <string.h>
+
 
 
 /*
@@ -173,6 +175,32 @@ vec_get_float8(TupleTableSlot *slot, int attnum)
     return DatumGetFloat8(d);
 }
 
+/* VECTORIZED: extract int32 from slot without full tuple copy */
+static inline int32
+vec_get_int32(TupleTableSlot *slot, int attnum)
+{
+	bool isnull;
+	Datum d = slot_getattr(slot, attnum, &isnull);
+	if (isnull) return 0;
+	return DatumGetInt32(d);
+}
+
+/* VECTORIZED: passenger_count groups are 1..7 for taxi_trips */
+#define VEC_AGG_MAX_GROUPS 8
+#define VEC_AGG_COL_PASSENGER 2
+#define VEC_AGG_COL_DIST 3
+#define VEC_AGG_COL_FARE 4
+
+static inline void
+vec_agg_reset(ScanState *node)
+{
+	if (node->vec_agg_sum)
+		memset(node->vec_agg_sum, 0, VEC_AGG_MAX_GROUPS * sizeof(float8));
+	if (node->vec_agg_count)
+		memset(node->vec_agg_count, 0, VEC_AGG_MAX_GROUPS * sizeof(int64));
+	node->vec_agg_logged = false;
+}
+
 TupleTableSlot *
 ExecScan(ScanState *node,
          ExecScanAccessMtd accessMtd,
@@ -204,10 +232,18 @@ ExecScan(ScanState *node,
             palloc0(VECTOR_BATCH_SIZE * sizeof(float8));
         node->vec_col4  = (float8 *)
             palloc0(VECTOR_BATCH_SIZE * sizeof(float8));
+		node->vec_agg_sum = (float8 *)
+			palloc0(VEC_AGG_MAX_GROUPS * sizeof(float8));
+		node->vec_agg_count = (int64 *)
+			palloc0(VEC_AGG_MAX_GROUPS * sizeof(int64));
         node->vec_size  = 0;
         node->vec_index = 0;
         node->vec_done  = false;
         node->vec_init  = true;
+
+		/* VECTORIZED: enable aggregate tracking for 2-col scan targetlist */
+		node->vec_agg_enabled = (list_length(node->ps.plan->targetlist) == 2);
+		node->vec_agg_logged = false;
     }
 
     /* VECTORIZED: serve next passing tuple from current batch */
@@ -233,6 +269,22 @@ ExecScan(ScanState *node,
         /* batch exhausted */
         if (node->vec_done)
         {
+			if (node->vec_agg_enabled && !node->vec_agg_logged)
+			{
+				int i;
+
+				for (i = 1; i < VEC_AGG_MAX_GROUPS; i++)
+				{
+					if (node->vec_agg_count[i] == 0)
+						continue;
+					elog(LOG,
+						 "VECTORIZED AGG: passenger_count=%d avg_fare=%.6f count=%" INT64_FORMAT,
+						 i,
+						 node->vec_agg_sum[i] / (double) node->vec_agg_count[i],
+						 node->vec_agg_count[i]);
+				}
+				node->vec_agg_logged = true;
+			}
             if (projInfo)
                 return ExecClearTuple(projInfo->pi_state.resultslot);
             return ExecClearTuple(node->ss_ScanTupleSlot);
@@ -263,6 +315,8 @@ ExecScan(ScanState *node,
             for (i = 0; i < VECTOR_BATCH_SIZE; i++)
             {
                 TupleTableSlot *slot;
+				int32  passenger;
+				float8 fare;
 
                 ResetExprContext(econtext);
                 slot = ExecScanFetch(node, accessMtd, recheckMtd);
@@ -274,7 +328,7 @@ ExecScan(ScanState *node,
                 }
 
                 /* extract trip_distance first — cheap, no copy */
-                dist = vec_get_float8(slot, 3);
+				dist = vec_get_float8(slot, VEC_AGG_COL_DIST);
 
                 /* VECTORIZED: filter check — skip copy if fails */
                 if (qual != NULL && dist <= 5.0)
@@ -285,6 +339,17 @@ ExecScan(ScanState *node,
                 }
 
                 /* passes filter — copy tuple for projection */
+				if (node->vec_agg_enabled)
+				{
+					passenger = vec_get_int32(slot, VEC_AGG_COL_PASSENGER);
+					fare = vec_get_float8(slot, VEC_AGG_COL_FARE);
+					if (passenger > 0 && passenger < VEC_AGG_MAX_GROUPS)
+					{
+						node->vec_agg_sum[passenger] += fare;
+						node->vec_agg_count[passenger]++;
+					}
+				}
+
                 node->vec_batch[node->vec_size] = ExecCopySlotHeapTuple(slot);
                 node->vec_qual[node->vec_size]  = true;
                 node->vec_size++;
@@ -392,5 +457,14 @@ ExecScanReScan(ScanState *node)
 					epqstate->epqExtra->relsubs_blocked[rtindex - 1];
 			}
 		}
+	}
+
+	/* VECTORIZED: reset batch and aggregate state on rescan */
+	if (node->vec_init)
+	{
+		node->vec_size = 0;
+		node->vec_index = 0;
+		node->vec_done = false;
+		vec_agg_reset(node);
 	}
 }

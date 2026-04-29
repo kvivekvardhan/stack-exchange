@@ -8,10 +8,10 @@ function toNumber(value, fallback) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-function buildPoolConfig() {
-  const fromConnectionString = process.env.DATABASE_URL
+function buildPoolConfig(connectionString) {
+  const fromConnectionString = connectionString
     ? {
-        connectionString: process.env.DATABASE_URL
+        connectionString
       }
     : {
         host: process.env.PGHOST || "localhost",
@@ -38,14 +38,40 @@ function buildPoolConfig() {
   };
 }
 
-const pool = new Pool(buildPoolConfig());
+const pool = new Pool(buildPoolConfig(process.env.DATABASE_URL));
+const baselinePool = new Pool(
+  buildPoolConfig(process.env.BASELINE_DATABASE_URL || process.env.DATABASE_URL)
+);
+const vectorPool = new Pool(
+  buildPoolConfig(process.env.VECTOR_DATABASE_URL || process.env.DATABASE_URL)
+);
 
-pool.on("error", (error) => {
-  console.error("Unexpected PostgreSQL pool error", error);
-});
+function handlePoolError(label) {
+  return (error) => {
+    console.error(`Unexpected PostgreSQL pool error (${label})`, error);
+  };
+}
+
+pool.on("error", handlePoolError("default"));
+baselinePool.on("error", handlePoolError("baseline"));
+vectorPool.on("error", handlePoolError("vectorized"));
+
+function resolvePool(engine) {
+  if (engine === "vectorized") {
+    return vectorPool;
+  }
+  if (engine === "baseline") {
+    return baselinePool;
+  }
+  return pool;
+}
 
 export async function query(text, params = []) {
   return pool.query(text, params);
+}
+
+export async function queryWithEngine(engine, text, params = []) {
+  return resolvePool(engine).query(text, params);
 }
 
 export async function withTransaction(work) {
@@ -63,6 +89,23 @@ export async function withTransaction(work) {
   }
 }
 
+export async function withTransactionEngine(engine, work) {
+  const client = await resolvePool(engine).connect();
+  try {
+    await client.query("BEGIN");
+    const result = await work(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 export async function closePool() {
   await pool.end();
+  await baselinePool.end();
+  await vectorPool.end();
 }

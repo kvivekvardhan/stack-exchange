@@ -1,6 +1,6 @@
 import cors from "cors";
 import express from "express";
-import { query, withTransaction } from "./db/pool.js";
+import { query, queryWithEngine, withTransactionEngine } from "./db/pool.js";
 
 const app = express();
 const port = process.env.PORT || 4000;
@@ -11,6 +11,22 @@ app.use(express.json());
 function hrtimeToMs(start) {
   const diffNs = process.hrtime.bigint() - start;
   return Number(diffNs) / 1_000_000;
+}
+
+function getEngine(req) {
+  const rawEngine = String(req.query.engine || req.headers["x-db-engine"] || "").toLowerCase();
+  if (rawEngine === "vectorized") {
+    return "vectorized";
+  }
+  if (rawEngine === "baseline") {
+    return "baseline";
+  }
+  return "baseline";
+}
+
+function isInspectorEnabled(req) {
+  const raw = String(req.query.inspect || "").toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes";
 }
 
 const recentViewEvents = new Map();
@@ -110,13 +126,32 @@ function mapSearchQuestion(row) {
   };
 }
 
-async function questionExists(questionId) {
-  const result = await query("SELECT 1 FROM questions WHERE id = $1", [questionId]);
+async function runQuery(engine, sql, params = [], options = {}) {
+  const start = process.hrtime.bigint();
+  const result = await queryWithEngine(engine, sql, params);
+  const timingMs = Number(hrtimeToMs(start).toFixed(3));
+
+  let plan = null;
+  if (options.inspect) {
+    const explainResult = await queryWithEngine(
+      engine,
+      `EXPLAIN (FORMAT TEXT) ${sql}`,
+      params
+    );
+    plan = explainResult.rows.map((row) => row["QUERY PLAN"]).join("\n");
+  }
+
+  return { result, timingMs, plan };
+}
+
+async function questionExists(engine, questionId) {
+  const result = await queryWithEngine(engine, "SELECT 1 FROM questions WHERE id = $1", [questionId]);
   return result.rowCount > 0;
 }
 
-async function answerBelongsToQuestion(questionId, answerId) {
-  const result = await query(
+async function answerBelongsToQuestion(engine, questionId, answerId) {
+  const result = await queryWithEngine(
+    engine,
     "SELECT 1 FROM answers WHERE id = $1 AND question_id = $2",
     [answerId, questionId]
   );
@@ -143,9 +178,8 @@ async function getOrCreateTagId(client, tagName) {
   return existing.rows[0].id;
 }
 
-async function fetchQuestionDetails(questionId) {
-  const questionResult = await query(
-    `
+async function fetchQuestionDetails(engine, questionId, options = {}) {
+  const questionQuery = `
     SELECT
       q.id,
       q.title,
@@ -161,31 +195,33 @@ async function fetchQuestionDetails(questionId) {
     WHERE q.id = $1
     GROUP BY q.id
     LIMIT 1
-    `,
-    [questionId]
-  );
+  `;
+  const questionResult = await runQuery(engine, questionQuery, [questionId], {
+    inspect: options.inspect
+  });
 
-  if (questionResult.rowCount === 0) {
+  if (questionResult.result.rowCount === 0) {
     return null;
   }
 
-  const questionRow = questionResult.rows[0];
+  const questionRow = questionResult.result.rows[0];
 
-  const answerResult = await query(
-    `
+  const answerQuery = `
     SELECT id, question_id, author, score, body, created_at
     FROM answers
     WHERE question_id = $1
     ORDER BY created_at ASC, id ASC
-    `,
-    [questionId]
-  );
+  `;
+  const answerResult = await runQuery(engine, answerQuery, [questionId], {
+    inspect: options.inspect
+  });
 
-  const answerIds = answerResult.rows.map((row) => row.id);
+  const answerIds = answerResult.result.rows.map((row) => row.id);
   const repliesByAnswer = new Map();
 
   if (answerIds.length > 0) {
-    const replyResult = await query(
+    const replyResult = await queryWithEngine(
+      engine,
       `
       SELECT id, answer_id, author, score, body, created_at
       FROM replies
@@ -209,22 +245,41 @@ async function fetchQuestionDetails(questionId) {
   }
 
   return {
-    id: questionRow.id,
-    title: questionRow.title,
-    body: questionRow.body,
-    tags: questionRow.tags || [],
-    askedBy: normalizeAuthor(questionRow.asked_by),
-    score: questionRow.score,
-    views: questionRow.views || 0,
-    createdAt: questionRow.created_at,
-    answers: answerResult.rows.map((answer) => ({
-      id: answer.id,
-      author: normalizeAuthor(answer.author),
-      score: answer.score,
-      body: answer.body,
-      createdAt: answer.created_at,
-      replies: repliesByAnswer.get(answer.id) || []
-    }))
+    data: {
+      id: questionRow.id,
+      title: questionRow.title,
+      body: questionRow.body,
+      tags: questionRow.tags || [],
+      askedBy: normalizeAuthor(questionRow.asked_by),
+      score: questionRow.score,
+      views: questionRow.views || 0,
+      createdAt: questionRow.created_at,
+      answers: answerResult.result.rows.map((answer) => ({
+        id: answer.id,
+        author: normalizeAuthor(answer.author),
+        score: answer.score,
+        body: answer.body,
+        createdAt: answer.created_at,
+        replies: repliesByAnswer.get(answer.id) || []
+      }))
+    },
+    timingMs: Number((questionResult.timingMs + answerResult.timingMs).toFixed(3)),
+    inspector: options.inspect
+      ? [
+          {
+            name: "question",
+            sql: questionQuery.trim(),
+            params: [questionId],
+            plan: questionResult.plan
+          },
+          {
+            name: "answers",
+            sql: answerQuery.trim(),
+            params: [questionId],
+            plan: answerResult.plan
+          }
+        ]
+      : []
   };
 }
 
@@ -240,12 +295,12 @@ app.get("/health", async (_req, res) => {
 app.get(
   "/search",
   asyncHandler(async (req, res) => {
-    const start = process.hrtime.bigint();
+    const engine = getEngine(req);
+    const inspect = isInspectorEnabled(req);
     const q = String(req.query.q || "").trim().toLowerCase();
     const tag = String(req.query.tag || "").trim().toLowerCase();
 
-    const searchResult = await query(
-      `
+    const searchSql = `
       SELECT
         q.id,
         q.title,
@@ -275,18 +330,28 @@ app.get(
         )
       GROUP BY q.id, answer_counts.answer_count
       ORDER BY q.score DESC, q.created_at DESC
-      `,
-      [q, tag]
-    );
+    `;
+    const searchResult = await runQuery(engine, searchSql, [q, tag], { inspect });
 
-    const responseRows = searchResult.rows.map(mapSearchQuestion);
-    const timingMs = Number(hrtimeToMs(start).toFixed(3));
+    const responseRows = searchResult.result.rows.map(mapSearchQuestion);
+    const timingMs = searchResult.timingMs;
 
     res.json({
       meta: {
         timingMs,
         resultCount: responseRows.length,
-        query: { q, tag }
+        query: { q, tag },
+        engine,
+        inspector: inspect
+          ? [
+              {
+                name: "search",
+                sql: searchSql.trim(),
+                params: [q, tag],
+                plan: searchResult.plan
+              }
+            ]
+          : []
       },
       data: responseRows
     });
@@ -296,7 +361,8 @@ app.get(
 app.get(
   "/question/:id",
   asyncHandler(async (req, res) => {
-    const start = process.hrtime.bigint();
+    const engine = getEngine(req);
+    const inspect = isInspectorEnabled(req);
     const questionId = toIntegerId(req.params.id);
 
     if (!questionId) {
@@ -304,22 +370,24 @@ app.get(
     }
 
     if (shouldCountView(req, questionId)) {
-      await query("UPDATE questions SET views = views + 1 WHERE id = $1", [questionId]);
+      await queryWithEngine(engine, "UPDATE questions SET views = views + 1 WHERE id = $1", [
+        questionId
+      ]);
     }
 
-    const question = await fetchQuestionDetails(questionId);
+    const question = await fetchQuestionDetails(engine, questionId, { inspect });
 
     if (!question) {
       return notFound(res, `Question with id ${req.params.id} was not found`);
     }
 
-    const timingMs = Number(hrtimeToMs(start).toFixed(3));
-
     return res.json({
       meta: {
-        timingMs
+        timingMs: question.timingMs,
+        engine,
+        inspector: question.inspector
       },
-      data: question
+      data: question.data
     });
   })
 );
@@ -327,6 +395,7 @@ app.get(
 app.post(
   "/questions",
   asyncHandler(async (req, res) => {
+    const engine = getEngine(req);
     const title = String(req.body?.title || "").trim();
     const body = String(req.body?.body || "").trim();
     const author = normalizeAuthor(req.body?.author);
@@ -341,7 +410,7 @@ app.post(
 
     const tags = normalizeTags(req.body?.tags);
 
-    const question = await withTransaction(async (client) => {
+    const question = await withTransactionEngine(engine, async (client) => {
       const inserted = await client.query(
         `
         INSERT INTO questions (title, body, asked_by)
@@ -380,7 +449,8 @@ app.post(
 
     return res.status(201).json({
       message: "Question posted",
-      data: question
+      data: question,
+      meta: { engine }
     });
   })
 );
@@ -388,12 +458,14 @@ app.post(
 app.post(
   "/question/:id/upvote",
   asyncHandler(async (req, res) => {
+    const engine = getEngine(req);
     const questionId = toIntegerId(req.params.id);
     if (!questionId) {
       return notFound(res, `Question with id ${req.params.id} was not found`);
     }
 
-    const updated = await query(
+    const updated = await queryWithEngine(
+      engine,
       `
       UPDATE questions
       SET score = score + 1
@@ -409,7 +481,8 @@ app.post(
 
     return res.json({
       message: "Question upvoted",
-      data: updated.rows[0]
+      data: updated.rows[0],
+      meta: { engine }
     });
   })
 );
@@ -417,12 +490,13 @@ app.post(
 app.post(
   "/question/:id/answers",
   asyncHandler(async (req, res) => {
+    const engine = getEngine(req);
     const questionId = toIntegerId(req.params.id);
     if (!questionId) {
       return notFound(res, `Question with id ${req.params.id} was not found`);
     }
 
-    if (!(await questionExists(questionId))) {
+    if (!(await questionExists(engine, questionId))) {
       return notFound(res, `Question with id ${req.params.id} was not found`);
     }
 
@@ -433,7 +507,8 @@ app.post(
       return badRequest(res, "Answer body is required");
     }
 
-    const inserted = await query(
+    const inserted = await queryWithEngine(
+      engine,
       `
       INSERT INTO answers (question_id, author, body)
       VALUES ($1, $2, $3)
@@ -453,7 +528,8 @@ app.post(
         body: answer.body,
         createdAt: answer.created_at,
         replies: []
-      }
+      },
+      meta: { engine }
     });
   })
 );
@@ -461,6 +537,7 @@ app.post(
 app.post(
   "/question/:questionId/answers/:answerId/upvote",
   asyncHandler(async (req, res) => {
+    const engine = getEngine(req);
     const questionId = toIntegerId(req.params.questionId);
     const answerId = toIntegerId(req.params.answerId);
 
@@ -472,7 +549,8 @@ app.post(
       return notFound(res, `Answer with id ${req.params.answerId} was not found`);
     }
 
-    const updated = await query(
+    const updated = await queryWithEngine(
+      engine,
       `
       UPDATE answers
       SET score = score + 1
@@ -483,7 +561,7 @@ app.post(
     );
 
     if (updated.rowCount === 0) {
-      if (!(await questionExists(questionId))) {
+      if (!(await questionExists(engine, questionId))) {
         return notFound(res, `Question with id ${req.params.questionId} was not found`);
       }
 
@@ -492,7 +570,8 @@ app.post(
 
     return res.json({
       message: "Answer upvoted",
-      data: updated.rows[0]
+      data: updated.rows[0],
+      meta: { engine }
     });
   })
 );
@@ -500,6 +579,7 @@ app.post(
 app.post(
   "/question/:questionId/answers/:answerId/replies",
   asyncHandler(async (req, res) => {
+    const engine = getEngine(req);
     const questionId = toIntegerId(req.params.questionId);
     const answerId = toIntegerId(req.params.answerId);
 
@@ -511,11 +591,11 @@ app.post(
       return notFound(res, `Answer with id ${req.params.answerId} was not found`);
     }
 
-    if (!(await questionExists(questionId))) {
+    if (!(await questionExists(engine, questionId))) {
       return notFound(res, `Question with id ${req.params.questionId} was not found`);
     }
 
-    if (!(await answerBelongsToQuestion(questionId, answerId))) {
+    if (!(await answerBelongsToQuestion(engine, questionId, answerId))) {
       return notFound(res, `Answer with id ${req.params.answerId} was not found`);
     }
 
@@ -526,7 +606,8 @@ app.post(
       return badRequest(res, "Reply body is required");
     }
 
-    const inserted = await query(
+    const inserted = await queryWithEngine(
+      engine,
       `
       INSERT INTO replies (answer_id, author, body)
       VALUES ($1, $2, $3)
@@ -545,7 +626,8 @@ app.post(
         score: reply.score,
         body: reply.body,
         createdAt: reply.created_at
-      }
+      },
+      meta: { engine }
     });
   })
 );
@@ -553,6 +635,7 @@ app.post(
 app.post(
   "/question/:questionId/answers/:answerId/replies/:replyId/upvote",
   asyncHandler(async (req, res) => {
+    const engine = getEngine(req);
     const questionId = toIntegerId(req.params.questionId);
     const answerId = toIntegerId(req.params.answerId);
     const replyId = toIntegerId(req.params.replyId);
@@ -569,7 +652,8 @@ app.post(
       return notFound(res, `Reply with id ${req.params.replyId} was not found`);
     }
 
-    const updated = await query(
+    const updated = await queryWithEngine(
+      engine,
       `
       UPDATE replies AS r
       SET score = r.score + 1
@@ -584,11 +668,11 @@ app.post(
     );
 
     if (updated.rowCount === 0) {
-      if (!(await questionExists(questionId))) {
+      if (!(await questionExists(engine, questionId))) {
         return notFound(res, `Question with id ${req.params.questionId} was not found`);
       }
 
-      if (!(await answerBelongsToQuestion(questionId, answerId))) {
+      if (!(await answerBelongsToQuestion(engine, questionId, answerId))) {
         return notFound(res, `Answer with id ${req.params.answerId} was not found`);
       }
 
@@ -597,7 +681,150 @@ app.post(
 
     return res.json({
       message: "Reply upvoted",
-      data: updated.rows[0]
+      data: updated.rows[0],
+      meta: { engine }
+    });
+  })
+);
+
+app.get(
+  "/tags",
+  asyncHandler(async (req, res) => {
+    const engine = getEngine(req);
+    const inspect = isInspectorEnabled(req);
+    const search = String(req.query.q || "").trim().toLowerCase();
+
+    const tagsSql = `
+      SELECT t.id, t.name, t.description, COUNT(qt.question_id)::int AS question_count
+      FROM tags t
+      LEFT JOIN question_tags qt ON qt.tag_id = t.id
+      WHERE ($1 = '' OR LOWER(t.name) LIKE '%' || $1 || '%')
+      GROUP BY t.id
+      ORDER BY question_count DESC, t.name ASC
+      LIMIT 100
+    `;
+
+    const tagResult = await runQuery(engine, tagsSql, [search], { inspect });
+    const timingMs = tagResult.timingMs;
+
+    res.json({
+      meta: {
+        timingMs,
+        engine,
+        query: { q: search },
+        inspector: inspect
+          ? [
+              {
+                name: "tags",
+                sql: tagsSql.trim(),
+                params: [search],
+                plan: tagResult.plan
+              }
+            ]
+          : []
+      },
+      data: tagResult.result.rows.map((row) => ({
+        id: row.id,
+        name: row.name,
+        description: row.description,
+        questionCount: row.question_count
+      }))
+    });
+  })
+);
+
+app.get(
+  "/benchmark",
+  asyncHandler(async (req, res) => {
+    const inspect = isInspectorEnabled(req);
+    const searchTerm = String(req.query.q || "postgres").trim().toLowerCase();
+    const tagTerm = String(req.query.tag || "sql").trim().toLowerCase();
+
+    const queries = [
+      {
+        name: "search",
+        sql: `
+          SELECT q.id
+          FROM questions q
+          WHERE ($1 = '' OR LOWER(q.title || ' ' || q.body) LIKE '%' || $1 || '%')
+          ORDER BY q.score DESC, q.created_at DESC
+          LIMIT 25
+        `,
+        params: [searchTerm]
+      },
+      {
+        name: "tag_filter",
+        sql: `
+          SELECT q.id
+          FROM questions q
+          WHERE ($1 = '' OR EXISTS (
+            SELECT 1
+            FROM question_tags qt
+            JOIN tags t ON t.id = qt.tag_id
+            WHERE qt.question_id = q.id
+              AND LOWER(t.name) LIKE '%' || $1 || '%'
+          ))
+          ORDER BY q.score DESC, q.created_at DESC
+          LIMIT 25
+        `,
+        params: [tagTerm]
+      },
+      {
+        name: "tag_aggregate",
+        sql: `
+          SELECT t.name, COUNT(qt.question_id)::int AS question_count
+          FROM tags t
+          LEFT JOIN question_tags qt ON qt.tag_id = t.id
+          GROUP BY t.id
+          ORDER BY question_count DESC
+          LIMIT 10
+        `,
+        params: []
+      }
+    ];
+
+    async function runBenchmark(engine) {
+      const results = [];
+      for (const item of queries) {
+        const outcome = await runQuery(engine, item.sql, item.params, { inspect });
+        results.push({
+          name: item.name,
+          timingMs: outcome.timingMs,
+          plan: inspect ? outcome.plan : null
+        });
+      }
+      return results;
+    }
+
+    const [baseline, vectorized] = await Promise.all([
+      runBenchmark("baseline"),
+      runBenchmark("vectorized")
+    ]);
+
+    const inspector = inspect
+      ? queries.map((item, index) => ({
+          name: item.name,
+          sql: item.sql.trim(),
+          params: item.params,
+          plan: [
+            "Baseline:",
+            baseline[index]?.plan || "(no plan)",
+            "",
+            "Vectorized:",
+            vectorized[index]?.plan || "(no plan)"
+          ].join("\n")
+        }))
+      : [];
+
+    res.json({
+      meta: {
+        query: { q: searchTerm, tag: tagTerm },
+        inspector
+      },
+      data: {
+        baseline,
+        vectorized
+      }
     });
   })
 );

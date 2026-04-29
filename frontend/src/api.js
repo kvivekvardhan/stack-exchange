@@ -1,3 +1,5 @@
+import { getStoredEngine, getStoredInspect } from "./EngineContext";
+
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "/api";
 
 function buildUrl(path, params = {}) {
@@ -14,6 +16,15 @@ function buildUrl(path, params = {}) {
   return url.toString();
 }
 
+function withClientParams(params) {
+  const next = { ...params };
+  next.engine = getStoredEngine();
+  if (getStoredInspect()) {
+    next.inspect = "1";
+  }
+  return next;
+}
+
 async function request(path, params = {}, options = {}) {
   const headers = options.body
     ? {
@@ -22,7 +33,7 @@ async function request(path, params = {}, options = {}) {
       }
     : options.headers;
 
-  const response = await fetch(buildUrl(path, params), {
+  const response = await fetch(buildUrl(path, withClientParams(params)), {
     method: options.method || "GET",
     headers,
     body: options.body ? JSON.stringify(options.body) : undefined
@@ -39,6 +50,14 @@ async function request(path, params = {}, options = {}) {
 
 export function searchQuestions({ q, tag }) {
   return request("/search", { q, tag });
+}
+
+export function getTags({ q } = {}) {
+  return request("/tags", { q });
+}
+
+export function getBenchmark({ q, tag } = {}) {
+  return request("/benchmark", { q, tag });
 }
 
 export function getQuestion(id) {

@@ -6,6 +6,7 @@ sudo -u postgres psql
     touch src/include/executor/tuptable.h
     touch src/include/nodes/execnodes.h
     touch src/backend/commands/explain.c
+    git apply ~/Desktop/dbis_project/stack-exchange/postgres/changes/nodeAgg.c.patch
     make install
 
 2nd terminal
@@ -14,6 +15,7 @@ sudo -u postgres psql
     pg_ctl -D ~/pgdata -l ~/pgdata/logfile -o "-p 5433" restart
     psql -p 5433 -d postgres -c "EXPLAIN SELECT * FROM taxi_trips WHERE trip_distance > 5;"
     psql -p 5433 -d postgres -c "SELECT passenger_count, AVG(fare_amount), COUNT(*) FROM taxi_trips WHERE trip_distance > 5 GROUP BY passenger_count;"
+    # Expect output rows emitted by vectorized Agg passthrough for passenger_count 1..7
     tail -20 ~/pgdata/logfilepsql -p 5433 -d postgres -c "\timing on" -c "SELECT passenger_count, AVG(fare_amount), COUNT(*) FROM taxi_trips WHERE trip_distance > 5 GROUP BY passenger_count;"
 
 

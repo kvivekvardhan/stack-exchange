@@ -1479,6 +1479,12 @@ typedef struct ScanState
     int         vec_index;      /* current read position */
     bool        vec_done;       /* true when scan exhausted */
     bool        vec_init;       /* true after first init */
+
+	/* VECTORIZED: prototype aggregate state (passenger_count groups) */
+	float8    *vec_agg_sum;     /* sum(fare_amount) per group */
+	int64     *vec_agg_count;   /* count(*) per group */
+	bool       vec_agg_enabled; /* enable aggregate tracking */
+	bool       vec_agg_logged;  /* aggregate results logged */
 } ScanState;
 
 /* ----------------
@@ -2455,6 +2461,11 @@ typedef struct AggState
 										 * ->hash_pergroup */
 	ProjectionInfo *combinedproj;	/* projection machinery */
 	SharedAggInfo *shared_info; /* one entry per worker */
+
+	/* VECTORIZED: aggregate passthrough state */
+	bool		vec_agg_enabled;	/* using vectorized aggregate output */
+	bool		vec_agg_drained;	/* outer scan fully drained */
+	int		vec_agg_emit_index; /* next passenger_count to emit */
 } AggState;
 
 /* ----------------

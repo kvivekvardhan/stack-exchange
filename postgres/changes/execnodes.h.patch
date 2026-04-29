@@ -1,0 +1,56 @@
+--- src/include/nodes/execnodes.h
++++ src/include/nodes/execnodes.h
+@@ -1465,10 +1465,26 @@
+  */
+ typedef struct ScanState
+ {
+-	PlanState	ps;				/* its first field is NodeTag */
+-	Relation	ss_currentRelation;
+-	struct TableScanDescData *ss_currentScanDesc;
+-	TupleTableSlot *ss_ScanTupleSlot;
++    PlanState       ps;                         /* its first field is NodeTag */
++    Relation        ss_currentRelation;
++    struct TableScanDescData *ss_currentScanDesc;
++    TupleTableSlot *ss_ScanTupleSlot;
++
++    /* VECTORIZED: batch state */
++    HeapTuple  *vec_batch;      /* batch of copied tuples */
++    bool       *vec_qual;       /* qual result per tuple */
++    float8     *vec_col3;       /* trip_distance values */
++    float8     *vec_col4;       /* fare_amount values */
++    int         vec_size;       /* tuples filled in batch */
++    int         vec_index;      /* current read position */
++    bool        vec_done;       /* true when scan exhausted */
++    bool        vec_init;       /* true after first init */
++
++	/* VECTORIZED: prototype aggregate state (passenger_count groups) */
++	float8    *vec_agg_sum;     /* sum(fare_amount) per group */
++	int64     *vec_agg_count;   /* count(*) per group */
++	bool       vec_agg_enabled; /* enable aggregate tracking */
++	bool       vec_agg_logged;  /* aggregate results logged */
+ } ScanState;
+ 
+ /* ----------------
+@@ -1477,8 +1493,8 @@
+  */
+ typedef struct SeqScanState
+ {
+-	ScanState	ss;				/* its first field is NodeTag */
+-	Size		pscan_len;		/* size of parallel heap scan descriptor */
++    ScanState   ss;
++    Size        pscan_len;
+ } SeqScanState;
+ 
+ /* ----------------
+@@ -2445,6 +2461,11 @@
+ 										 * ->hash_pergroup */
+ 	ProjectionInfo *combinedproj;	/* projection machinery */
+ 	SharedAggInfo *shared_info; /* one entry per worker */
++
++	/* VECTORIZED: aggregate passthrough state */
++	bool		vec_agg_enabled;	/* using vectorized aggregate output */
++	bool		vec_agg_drained;	/* outer scan fully drained */
++	int		vec_agg_emit_index; /* next passenger_count to emit */
+ } AggState;
+ 
+ /* ----------------

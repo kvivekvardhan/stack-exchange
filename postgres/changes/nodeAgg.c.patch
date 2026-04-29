@@ -1,0 +1,150 @@
+--- src/backend/executor/nodeAgg.c
++++ src/backend/executor/nodeAgg.c
+@@ -258,6 +258,7 @@
+ #include "executor/execExpr.h"
+ #include "executor/executor.h"
+ #include "executor/nodeAgg.h"
++#include "executor/nodeSeqscan.h"
+ #include "lib/hyperloglog.h"
+ #include "miscadmin.h"
+ #include "nodes/makefuncs.h"
+@@ -305,6 +306,9 @@
+  */
+ #define HASHAGG_READ_BUFFER_SIZE BLCKSZ
+ #define HASHAGG_WRITE_BUFFER_SIZE BLCKSZ
++
++/* VECTORIZED: prototype aggregate passthrough */
++#define VEC_AGG_MAX_GROUPS 8
+ 
+ /*
+  * HyperLogLog is used for estimating the cardinality of the spilled tuples in
+@@ -447,6 +451,8 @@
+ 									  Oid aggdeserialfn, Datum initValue,
+ 									  bool initValueIsNull, Oid *inputTypes,
+ 									  int numArguments);
++static bool vec_agg_supported(AggState *aggstate, ScanState **scanstate_out);
++static TupleTableSlot *vec_agg_emit(AggState *aggstate, ScanState *scanstate);
+ 
+ 
+ /*
+@@ -2141,8 +2147,34 @@
+ {
+ 	AggState   *node = castNode(AggState, pstate);
+ 	TupleTableSlot *result = NULL;
++	ScanState  *vec_scan = NULL;
+ 
+ 	CHECK_FOR_INTERRUPTS();
++
++	if (!node->agg_done && vec_agg_supported(node, &vec_scan))
++	{
++		node->vec_agg_enabled = true;
++		if (!node->vec_agg_drained)
++		{
++			TupleTableSlot *outer;
++
++			for (;;)
++			{
++				outer = ExecProcNode(outerPlanState(node));
++				if (TupIsNull(outer))
++					break;
++			}
++			node->vec_agg_drained = true;
++			node->vec_agg_emit_index = 1;
++		}
++
++		result = vec_agg_emit(node, vec_scan);
++		if (!TupIsNull(result))
++			return result;
++
++		node->agg_done = true;
++		return NULL;
++	}
+ 
+ 	if (!node->agg_done)
+ 	{
+@@ -2164,6 +2196,66 @@
+ 
+ 		if (!TupIsNull(result))
+ 			return result;
++	}
++
++	return NULL;
++}
++
++/* VECTORIZED: detect supported aggregate shape (prototype only) */
++static bool
++vec_agg_supported(AggState *aggstate, ScanState **scanstate_out)
++{
++	PlanState  *outer;
++	Agg	   *aggnode;
++	ScanState  *scan;
++
++	aggnode = (Agg *) aggstate->ss.ps.plan;
++	outer = outerPlanState(aggstate);
++	if (outer == NULL || !IsA(outer, SeqScanState))
++		return false;
++	if (aggnode->numCols != 1)
++		return false;
++	if (aggstate->numaggs != 2)
++		return false;
++	if (list_length(outer->plan->targetlist) != 2)
++		return false;
++
++	scan = &((SeqScanState *) outer)->ss;
++	*scanstate_out = scan;
++	return true;
++}
++
++/* VECTORIZED: emit aggregate output rows from scan state */
++static TupleTableSlot *
++vec_agg_emit(AggState *aggstate, ScanState *scanstate)
++{
++	TupleTableSlot *slot = aggstate->ss.ps.ps_ResultTupleSlot;
++	TupleDesc	 desc = slot->tts_tupleDescriptor;
++	int		 i;
++
++	if (desc->natts < 3)
++		return NULL;
++
++	for (i = aggstate->vec_agg_emit_index; i < VEC_AGG_MAX_GROUPS; i++)
++	{
++		int64 count = scanstate->vec_agg_count ? scanstate->vec_agg_count[i] : 0;
++
++		if (count == 0)
++			continue;
++
++		ExecClearTuple(slot);
++		memset(slot->tts_isnull, true, desc->natts * sizeof(bool));
++
++		slot->tts_values[0] = Int32GetDatum(i);
++		slot->tts_isnull[0] = false;
++		slot->tts_values[1] = Float8GetDatum(scanstate->vec_agg_sum[i] / (double) count);
++		slot->tts_isnull[1] = false;
++		slot->tts_values[2] = Int64GetDatum(count);
++		slot->tts_isnull[2] = false;
++		ExecStoreVirtualTuple(slot);
++
++		aggstate->vec_agg_emit_index = i + 1;
++		return slot;
+ 	}
+ 
+ 	return NULL;
+@@ -3203,6 +3295,9 @@
+ 	aggstate->curpertrans = NULL;
+ 	aggstate->input_done = false;
+ 	aggstate->agg_done = false;
++	aggstate->vec_agg_enabled = false;
++	aggstate->vec_agg_drained = false;
++	aggstate->vec_agg_emit_index = 0;
+ 	aggstate->pergroups = NULL;
+ 	aggstate->grp_firstTuple = NULL;
+ 	aggstate->sort_in = NULL;
+@@ -4352,6 +4447,8 @@
+ 	int			setno;
+ 
+ 	node->agg_done = false;
++	node->vec_agg_drained = false;
++	node->vec_agg_emit_index = 0;
+ 
+ 	if (node->aggstrategy == AGG_HASHED)
+ 	{

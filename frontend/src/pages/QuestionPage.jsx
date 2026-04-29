@@ -9,6 +9,7 @@ import {
   upvoteReply
 } from "../api";
 import Modal from "../components/Modal";
+import QueryInspector from "../components/QueryInspector";
 
 function formatDate(value) {
   const parsed = new Date(value);
@@ -74,6 +75,7 @@ export default function QuestionPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [question, setQuestion] = useState(null);
+  const [meta, setMeta] = useState(null);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState("");
 
@@ -97,10 +99,12 @@ export default function QuestionPage() {
         const response = await getQuestion(id);
         if (active) {
           setQuestion(response.data);
+          setMeta(response.meta || null);
         }
       } catch (requestError) {
         if (active) {
           setError(requestError.message);
+          setMeta(null);
         }
       } finally {
         if (active) {
@@ -396,6 +400,10 @@ export default function QuestionPage() {
             </button>
           </form>
         </Modal>
+      )}
+
+      {meta?.inspector && meta.inspector.length > 0 && (
+        <QueryInspector title="Question Queries" inspector={meta.inspector} />
       )}
     </section>
   );

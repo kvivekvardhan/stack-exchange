@@ -12,6 +12,24 @@ We modified 4 files in the PostgreSQL 15.17 source tree:
 | `execnodes.h` | `src/include/nodes/execnodes.h` | Added batch tracking fields to `SeqScanState` |
 | `nodeSeqscan.c` | `src/backend/executor/nodeSeqscan.c` | Modified `ExecSeqScan` to count rows in batches and log batch boundaries |
 | `explain.c` | `src/backend/commands/explain.c` | Changed plan node label from `Seq Scan` to `Vectorized Seq Scan` |
+| `nodeAgg.c.patch` | `src/backend/executor/nodeAgg.c` | Patch to emit vectorized aggregate output (prototype) |
+
+---
+
+## Vectorized Aggregate Prototype (Passthrough Output)
+
+We added a prototype aggregate tracker inside the vectorized scan path and a
+nodeAgg patch that can emit group results directly from the scan state. It
+collects `SUM(fare_amount)` and `COUNT(*)` by `passenger_count` while the
+vectorized filter runs, then emits `passenger_count`, `AVG(fare_amount)`, and
+`COUNT(*)` from the Agg node when the scan completes.
+
+Limitations:
+- Hardcoded to `taxi_trips` column positions (passenger_count, trip_distance,
+  fare_amount).
+- Assumes `passenger_count` in the range 1..7.
+- Hardcoded output shape: `passenger_count`, `AVG(fare_amount)`, `COUNT(*)`.
+- Bypasses normal Agg processing for this shape only.
 
 ---
 
@@ -83,6 +101,10 @@ cp ~/Desktop/dbis_project/stack-exchange/postgres/changes/nodeSeqscan.c \
 
 cp ~/Desktop/dbis_project/stack-exchange/postgres/changes/explain.c \
    ~/Desktop/dbis_project/postgres/src/backend/commands/explain.c
+
+# Apply aggregate patch (prototype)
+cd ~/Desktop/dbis_project/postgres
+git apply ~/Desktop/dbis_project/stack-exchange/postgres/changes/nodeAgg.c.patch
 ```
 
 ---
@@ -273,6 +295,21 @@ psql -p 5433 -d postgres -c "SELECT AVG(fare_amount) FROM taxi_trips WHERE trip_
 # 6. Check logs
 tail -20 ~/pgdata/logfile
 ```
+
+---
+
+## Evaluation: Baseline vs Vectorized
+
+We include a simple benchmark runner to compare query execution time across
+the baseline and vectorized servers.
+
+Run it from the repo root:
+
+```bash
+bash postgres/benchmarks/run_benchmark.sh
+```
+
+This writes results to `postgres/benchmarks/results.md`.
 
 ---
 

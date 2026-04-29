@@ -1,3 +1,32 @@
-- [] Setup env
-- [] Setup database
-- [] Setup postgres
+Based on the checkpoint text you pasted, here’s what’s still left to complete (mapped to the stated goals):
+
+**Platform features**
+- Tag browsing and filtering UI + API.
+- Benchmark page showing performance comparison.
+- Query inspector showing SQL + execution plan.
+- Engine selection toggle in UI and routing in backend.
+
+**Backend/API**
+- Query routing to baseline vs vectorized engine.
+- Query timing measurement and structured response payloads for frontend.
+- Endpoints needed for tag browse, benchmark, and inspector.
+
+**Database/engine work**
+- Extend aggregation operators for vectorized execution (beyond scan/filter).
+- Ensure vectorized execution is used in query paths (not just logging/EXPLAIN).
+
+**Dataset**
+- Load and use the Stack Overflow public dataset (posts, comments, users, tags).
+- Add/verify ETL/import steps and indexes for realistic scale.
+
+**Evaluation**
+- Benchmark queries and comparison framework (baseline vs vectorized).
+- Report performance results.
+
+If you want, I can align these with the current repo state and produce a concrete checklist.
+
+Continued with Autopilot: Task not yet complete
+
+
+
+Reviewed the pasted checkpoint text and listed remaining platform, backend, database, dataset, and benchmarking tasks still needed.

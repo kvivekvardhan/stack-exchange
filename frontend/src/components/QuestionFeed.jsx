@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { searchQuestions } from "../api";
+import QueryInspector from "./QueryInspector";
 
 const SORT_OPTIONS = [
   { value: "upvotes_desc", label: "Upvotes: High to Low" },
@@ -73,6 +74,7 @@ export default function QuestionFeed({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [results, setResults] = useState([]);
+  const [meta, setMeta] = useState(null);
 
   useEffect(() => {
     setSearchInput(urlQ);
@@ -93,11 +95,13 @@ export default function QuestionFeed({
         const response = await searchQuestions({ q: urlQ.trim(), tag: urlTag.trim() });
         if (active) {
           setResults(response.data);
+          setMeta(response.meta || null);
         }
       } catch (requestError) {
         if (active) {
           setError(requestError.message);
           setResults([]);
+          setMeta(null);
         }
       } finally {
         if (active) {
@@ -254,6 +258,10 @@ export default function QuestionFeed({
             View all questions
           </Link>
         </p>
+      )}
+
+      {meta?.inspector && meta.inspector.length > 0 && (
+        <QueryInspector inspector={meta.inspector} />
       )}
     </section>
   );
