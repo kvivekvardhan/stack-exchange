@@ -55,6 +55,9 @@ export default function Layout({ children }) {
             <NavLink to="/benchmark" className={navClassName}>
               Benchmark
             </NavLink>
+            <NavLink to="/inspector" className={navClassName}>
+              ⚡ Inspector
+            </NavLink>
           </nav>
         </aside>
         <main className="so-main">{children}</main>

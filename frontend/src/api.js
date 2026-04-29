@@ -112,3 +112,7 @@ export function upvoteReply(questionId, answerId, replyId) {
     { method: "POST" }
   );
 }
+
+export function inspectQuery(sql) {
+  return request("/inspect", {}, { method: "POST", body: { sql } });
+}

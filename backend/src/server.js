@@ -829,6 +829,84 @@ app.get(
   })
 );
 
+app.post(
+  "/inspect",
+  asyncHandler(async (req, res) => {
+    const sql = String(req.body?.sql || "").trim();
+
+    if (!sql) {
+      return badRequest(res, "SQL query is required");
+    }
+
+    // Safety: only allow SELECT statements
+    if (!/^\s*SELECT\b/i.test(sql)) {
+      return badRequest(res, "Only SELECT queries are allowed");
+    }
+
+    async function inspectEngine(engine) {
+      const start = process.hrtime.bigint();
+      let result, error = null;
+      try {
+        result = await queryWithEngine(engine, sql, []);
+      } catch (err) {
+        error = err.message;
+        result = null;
+      }
+      const execMs = Number(hrtimeToMs(start).toFixed(3));
+
+      let plan = null, planJson = null;
+      try {
+        const explainText = await queryWithEngine(
+          engine,
+          `EXPLAIN (ANALYZE, FORMAT TEXT) ${sql}`,
+          []
+        );
+        plan = explainText.rows.map((r) => r["QUERY PLAN"]).join("\n");
+      } catch (_) {}
+
+      try {
+        const explainJson = await queryWithEngine(
+          engine,
+          `EXPLAIN (ANALYZE, FORMAT JSON) ${sql}`,
+          []
+        );
+        planJson = explainJson.rows[0]["QUERY PLAN"];
+      } catch (_) {}
+
+      // Parse vectorized scan info from plan text
+      const isVectorized = plan ? plan.includes("Vectorized Seq Scan") : false;
+      const rowsMatch = plan ? plan.match(/rows=(\d+)/) : null;
+      const filterMatch = plan ? plan.match(/Rows Removed by Filter:\s*(\d+)/) : null;
+
+      return {
+        engine,
+        execMs,
+        rowCount: result ? result.rowCount : 0,
+        error,
+        plan,
+        planJson,
+        isVectorized,
+        estimatedRows: rowsMatch ? parseInt(rowsMatch[1], 10) : null,
+        filteredRows: filterMatch ? parseInt(filterMatch[1], 10) : null
+      };
+    }
+
+    const [baseline, vectorized] = await Promise.all([
+      inspectEngine("baseline"),
+      inspectEngine("vectorized")
+    ]);
+
+    const speedup = baseline.execMs > 0 && vectorized.execMs > 0
+      ? Number((baseline.execMs / vectorized.execMs).toFixed(2))
+      : null;
+
+    res.json({
+      meta: { sql, speedup },
+      data: { baseline, vectorized }
+    });
+  })
+);
+
 app.use((req, res) => {
   res.status(404).json({
     error: {

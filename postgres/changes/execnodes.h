@@ -1470,21 +1470,21 @@ typedef struct ScanState
     struct TableScanDescData *ss_currentScanDesc;
     TupleTableSlot *ss_ScanTupleSlot;
 
-    /* VECTORIZED: batch state */
-    HeapTuple  *vec_batch;      /* batch of copied tuples */
-    bool       *vec_qual;       /* qual result per tuple */
-    float8     *vec_col3;       /* trip_distance values */
-    float8     *vec_col4;       /* fare_amount values */
-    int         vec_size;       /* tuples filled in batch */
-    int         vec_index;      /* current read position */
-    bool        vec_done;       /* true when scan exhausted */
-    bool        vec_init;       /* true after first init */
+    /* VECTORIZED: streaming scan state */
+    bool        vec_init;           /* true after first init */
+    bool        vec_active;         /* cached: PG_VECTORIZED=1 && natts==6 */
+    int         vec_passed;         /* tuples passed filter in current window */
+    int         vec_filtered;       /* tuples filtered in current window */
+    int64       vec_total_passed;   /* total tuples passed across scan */
+    int64       vec_total_filtered; /* total tuples filtered across scan */
 
-	/* VECTORIZED: prototype aggregate state (passenger_count groups) */
-	float8    *vec_agg_sum;     /* sum(fare_amount) per group */
-	int64     *vec_agg_count;   /* count(*) per group */
-	bool       vec_agg_enabled; /* enable aggregate tracking */
-	bool       vec_agg_logged;  /* aggregate results logged */
+    /* VECTORIZED: multi-column aggregate state (passenger_count groups) */
+    float8     *vec_agg_sum;        /* sum(fare_amount) per group */
+    float8     *vec_agg_sum2;       /* sum(tip_amount) per group */
+    float8     *vec_agg_dist_sum;   /* sum(trip_distance) per group */
+    int64      *vec_agg_count;      /* count(*) per group */
+    bool        vec_agg_enabled;    /* enable aggregate tracking */
+    bool        vec_agg_logged;     /* aggregate results logged */
 } ScanState;
 
 /* ----------------

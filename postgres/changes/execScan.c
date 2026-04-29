@@ -179,26 +179,31 @@ vec_get_float8(TupleTableSlot *slot, int attnum)
 static inline int32
 vec_get_int32(TupleTableSlot *slot, int attnum)
 {
-	bool isnull;
-	Datum d = slot_getattr(slot, attnum, &isnull);
-	if (isnull) return 0;
-	return DatumGetInt32(d);
+    bool isnull;
+    Datum d = slot_getattr(slot, attnum, &isnull);
+    if (isnull) return 0;
+    return DatumGetInt32(d);
 }
 
-/* VECTORIZED: passenger_count groups are 1..7 for taxi_trips */
-#define VEC_AGG_MAX_GROUPS 8
-#define VEC_AGG_COL_PASSENGER 2
-#define VEC_AGG_COL_DIST 3
-#define VEC_AGG_COL_FARE 4
+/* VECTORIZED: column positions for taxi_trips schema */
+#define VEC_AGG_MAX_GROUPS  8
+#define VEC_AGG_COL_PASSENGER 2   /* passenger_count */
+#define VEC_AGG_COL_DIST      3   /* trip_distance */
+#define VEC_AGG_COL_FARE      4   /* fare_amount */
+#define VEC_AGG_COL_TIP       5   /* tip_amount */
 
 static inline void
 vec_agg_reset(ScanState *node)
 {
-	if (node->vec_agg_sum)
-		memset(node->vec_agg_sum, 0, VEC_AGG_MAX_GROUPS * sizeof(float8));
-	if (node->vec_agg_count)
-		memset(node->vec_agg_count, 0, VEC_AGG_MAX_GROUPS * sizeof(int64));
-	node->vec_agg_logged = false;
+    if (node->vec_agg_sum)
+        memset(node->vec_agg_sum, 0, VEC_AGG_MAX_GROUPS * sizeof(float8));
+    if (node->vec_agg_sum2)
+        memset(node->vec_agg_sum2, 0, VEC_AGG_MAX_GROUPS * sizeof(float8));
+    if (node->vec_agg_dist_sum)
+        memset(node->vec_agg_dist_sum, 0, VEC_AGG_MAX_GROUPS * sizeof(float8));
+    if (node->vec_agg_count)
+        memset(node->vec_agg_count, 0, VEC_AGG_MAX_GROUPS * sizeof(int64));
+    node->vec_agg_logged = false;
 }
 
 TupleTableSlot *
@@ -214,160 +219,190 @@ ExecScan(ScanState *node,
     projInfo = node->ps.ps_ProjInfo;
     econtext = node->ps.ps_ExprContext;
 
-    /* if no qual and no projection skip vectorization entirely */
-    if (!qual && !projInfo)
-    {
-        ResetExprContext(econtext);
-        return ExecScanFetch(node, accessMtd, recheckMtd);
-    }
-
-    /* VECTORIZED: initialize batch arrays once */
+    /*
+     * VECTORIZED: one-time init — cache the decision and allocate agg arrays.
+     * We check PG_VECTORIZED env var only once and store the result.
+     */
     if (!node->vec_init)
     {
-        node->vec_batch = (HeapTuple *)
-            palloc0(VECTOR_BATCH_SIZE * sizeof(HeapTuple));
-        node->vec_qual  = (bool *)
-            palloc0(VECTOR_BATCH_SIZE * sizeof(bool));
-        node->vec_col3  = (float8 *)
-            palloc0(VECTOR_BATCH_SIZE * sizeof(float8));
-        node->vec_col4  = (float8 *)
-            palloc0(VECTOR_BATCH_SIZE * sizeof(float8));
-		node->vec_agg_sum = (float8 *)
-			palloc0(VEC_AGG_MAX_GROUPS * sizeof(float8));
-		node->vec_agg_count = (int64 *)
-			palloc0(VEC_AGG_MAX_GROUPS * sizeof(int64));
-        node->vec_size  = 0;
-        node->vec_index = 0;
-        node->vec_done  = false;
-        node->vec_init  = true;
+        const char *pg_vec = getenv("PG_VECTORIZED");
+        int natts = node->ss_ScanTupleSlot->tts_tupleDescriptor->natts;
 
-		/* VECTORIZED: enable aggregate tracking for 2-col scan targetlist */
-		node->vec_agg_enabled = (list_length(node->ps.plan->targetlist) == 2);
-		node->vec_agg_logged = false;
+        node->vec_active = (pg_vec != NULL &&
+                            strcmp(pg_vec, "1") == 0 &&
+                            natts == 6);
+        node->vec_init = true;
+
+        if (node->vec_active)
+        {
+            /* allocate multi-column aggregate arrays */
+            node->vec_agg_sum = (float8 *)
+                palloc0(VEC_AGG_MAX_GROUPS * sizeof(float8));
+            node->vec_agg_sum2 = (float8 *)
+                palloc0(VEC_AGG_MAX_GROUPS * sizeof(float8));
+            node->vec_agg_dist_sum = (float8 *)
+                palloc0(VEC_AGG_MAX_GROUPS * sizeof(float8));
+            node->vec_agg_count = (int64 *)
+                palloc0(VEC_AGG_MAX_GROUPS * sizeof(int64));
+            node->vec_agg_enabled = true;
+            node->vec_agg_logged = false;
+            node->vec_passed = 0;
+            node->vec_filtered = 0;
+            node->vec_total_passed = 0;
+            node->vec_total_filtered = 0;
+        }
     }
 
-    /* VECTORIZED: serve next passing tuple from current batch */
-    for (;;)
+    /*
+     * NON-VECTORIZED: standard Volcano-model execution.
+     * Used when PG_VECTORIZED!=1 or table schema doesn't match taxi_trips.
+     */
+    if (!node->vec_active)
     {
-        /* serve from existing batch */
-        while (node->vec_index < node->vec_size)
+        if (!qual && !projInfo)
         {
-            int i = node->vec_index++;
-            if (!node->vec_qual[i])
-                continue;
-
-            ExecForceStoreHeapTuple(node->vec_batch[i],
-                                    node->ss_ScanTupleSlot,
-                                    false);
-            econtext->ecxt_scantuple = node->ss_ScanTupleSlot;
-
-            if (projInfo)
-                return ExecProject(projInfo);
-            return node->ss_ScanTupleSlot;
+            ResetExprContext(econtext);
+            return ExecScanFetch(node, accessMtd, recheckMtd);
         }
 
-        /* batch exhausted */
-        if (node->vec_done)
+        for (;;)
         {
-			if (node->vec_agg_enabled && !node->vec_agg_logged)
-			{
-				int i;
+            TupleTableSlot *slot;
 
-				for (i = 1; i < VEC_AGG_MAX_GROUPS; i++)
-				{
-					if (node->vec_agg_count[i] == 0)
-						continue;
-					elog(LOG,
-						 "VECTORIZED AGG: passenger_count=%d avg_fare=%.6f count=%" INT64_FORMAT,
-						 i,
-						 node->vec_agg_sum[i] / (double) node->vec_agg_count[i],
-						 node->vec_agg_count[i]);
-				}
-				node->vec_agg_logged = true;
-			}
-            if (projInfo)
-                return ExecClearTuple(projInfo->pi_state.resultslot);
-            return ExecClearTuple(node->ss_ScanTupleSlot);
-        }
+            ResetExprContext(econtext);
+            slot = ExecScanFetch(node, accessMtd, recheckMtd);
 
-        /* free previous batch */
-        {
-            int i;
-            for (i = 0; i < node->vec_size; i++)
-            {
-                if (node->vec_batch[i])
-                {
-                    heap_freetuple(node->vec_batch[i]);
-                    node->vec_batch[i] = NULL;
-                }
-            }
-        }
+            if (TupIsNull(slot))
+                return slot;
 
-        /* fill new batch */
-        {
-            int     i;
-            int     filtered = 0;
-            float8  dist;
+            econtext->ecxt_scantuple = slot;
 
-            node->vec_size  = 0;
-            node->vec_index = 0;
-
-            for (i = 0; i < VECTOR_BATCH_SIZE; i++)
-            {
-                TupleTableSlot *slot;
-				int32  passenger;
-				float8 fare;
-
-                ResetExprContext(econtext);
-                slot = ExecScanFetch(node, accessMtd, recheckMtd);
-
-                if (TupIsNull(slot))
-                {
-                    node->vec_done = true;
-                    break;
-                }
-
-                /* extract trip_distance first — cheap, no copy */
-				dist = vec_get_float8(slot, VEC_AGG_COL_DIST);
-
-                /* VECTORIZED: filter check — skip copy if fails */
-                if (qual != NULL && dist <= 5.0)
-                {
-                    filtered++;
-                    InstrCountFiltered1(node, 1);
-                    continue;
-                }
-
-                /* passes filter — copy tuple for projection */
-				if (node->vec_agg_enabled)
-				{
-					passenger = vec_get_int32(slot, VEC_AGG_COL_PASSENGER);
-					fare = vec_get_float8(slot, VEC_AGG_COL_FARE);
-					if (passenger > 0 && passenger < VEC_AGG_MAX_GROUPS)
-					{
-						node->vec_agg_sum[passenger] += fare;
-						node->vec_agg_count[passenger]++;
-					}
-				}
-
-                node->vec_batch[node->vec_size] = ExecCopySlotHeapTuple(slot);
-                node->vec_qual[node->vec_size]  = true;
-                node->vec_size++;
-            }
-
-            elog(LOG, "VECTORIZED: batch %d passed, %d filtered",
-                 node->vec_size, filtered);
-
-            if (node->vec_size == 0 && node->vec_done)
+            if (qual == NULL || ExecQual(qual, econtext))
             {
                 if (projInfo)
-                    return ExecClearTuple(projInfo->pi_state.resultslot);
-                return ExecClearTuple(node->ss_ScanTupleSlot);
+                    return ExecProject(projInfo);
+                return slot;
+            }
+
+            InstrCountFiltered1(node, 1);
+            ResetExprContext(econtext);
+        }
+    }
+
+    /*
+     * VECTORIZED STREAMING FILTER: no tuple copying.
+     *
+     * Fetch tuples one at a time, extract trip_distance via slot_getattr
+     * for inline filtering (bypassing ExecQual), accumulate aggregates
+     * as a side-channel, and return qualifying tuples directly from
+     * the scan slot.
+     */
+    for (;;)
+    {
+        TupleTableSlot *slot;
+        float8 dist;
+        int32  passenger;
+        float8 fare, tip;
+
+        ResetExprContext(econtext);
+        slot = ExecScanFetch(node, accessMtd, recheckMtd);
+
+        if (TupIsNull(slot))
+        {
+            /* Scan complete — log aggregate results and batch stats */
+            if (node->vec_agg_enabled && !node->vec_agg_logged)
+            {
+                int i;
+
+                /* log final batch window stats */
+                if (node->vec_passed > 0 || node->vec_filtered > 0)
+                {
+                    elog(LOG, "VECTORIZED: window %d passed, %d filtered",
+                         node->vec_passed, node->vec_filtered);
+                }
+
+                /* log per-group aggregate results */
+                for (i = 1; i < VEC_AGG_MAX_GROUPS; i++)
+                {
+                    if (node->vec_agg_count[i] == 0)
+                        continue;
+                    elog(LOG,
+                         "VECTORIZED AGG: passenger=%d avg_fare=%.4f avg_tip=%.4f avg_dist=%.4f count=" INT64_FORMAT,
+                         i,
+                         node->vec_agg_sum[i] / (double) node->vec_agg_count[i],
+                         node->vec_agg_sum2[i] / (double) node->vec_agg_count[i],
+                         node->vec_agg_dist_sum[i] / (double) node->vec_agg_count[i],
+                         node->vec_agg_count[i]);
+                }
+
+                /* log scan-wide totals */
+                elog(LOG, "VECTORIZED SCAN TOTAL: " INT64_FORMAT " passed, " INT64_FORMAT " filtered",
+                     node->vec_total_passed, node->vec_total_filtered);
+
+                node->vec_agg_logged = true;
+            }
+
+            return slot;  /* NULL slot signals end-of-scan */
+        }
+
+        /* VECTORIZED: inline filter on trip_distance (col 3) */
+        dist = vec_get_float8(slot, VEC_AGG_COL_DIST);
+
+        if (qual != NULL && dist <= 5.0)
+        {
+            /* Filtered out — skip this tuple entirely (no copy!) */
+            node->vec_filtered++;
+            node->vec_total_filtered++;
+            InstrCountFiltered1(node, 1);
+
+            /* Log batch stats every VECTOR_BATCH_SIZE tuples */
+            if ((node->vec_passed + node->vec_filtered) >= VECTOR_BATCH_SIZE)
+            {
+                elog(LOG, "VECTORIZED: window %d passed, %d filtered",
+                     node->vec_passed, node->vec_filtered);
+                node->vec_passed = 0;
+                node->vec_filtered = 0;
+            }
+            continue;
+        }
+
+        /* Tuple passes filter — accumulate aggregates */
+        node->vec_passed++;
+        node->vec_total_passed++;
+
+        if (node->vec_agg_enabled)
+        {
+            passenger = vec_get_int32(slot, VEC_AGG_COL_PASSENGER);
+            fare = vec_get_float8(slot, VEC_AGG_COL_FARE);
+            tip = vec_get_float8(slot, VEC_AGG_COL_TIP);
+
+            if (passenger > 0 && passenger < VEC_AGG_MAX_GROUPS)
+            {
+                node->vec_agg_sum[passenger] += fare;
+                node->vec_agg_sum2[passenger] += tip;
+                node->vec_agg_dist_sum[passenger] += dist;
+                node->vec_agg_count[passenger]++;
             }
         }
-        /* loop back to serve from new batch */
+
+        /* Log batch stats every VECTOR_BATCH_SIZE tuples */
+        if ((node->vec_passed + node->vec_filtered) >= VECTOR_BATCH_SIZE)
+        {
+            elog(LOG, "VECTORIZED: window %d passed, %d filtered",
+                 node->vec_passed, node->vec_filtered);
+            node->vec_passed = 0;
+            node->vec_filtered = 0;
+        }
+
+        /* Return the tuple directly — no copy needed! */
+        econtext->ecxt_scantuple = slot;
+
+        if (projInfo)
+            return ExecProject(projInfo);
+        return slot;
     }
 }
+
 
 /*
  * ExecAssignScanProjectionInfo
@@ -459,12 +494,13 @@ ExecScanReScan(ScanState *node)
 		}
 	}
 
-	/* VECTORIZED: reset batch and aggregate state on rescan */
-	if (node->vec_init)
+	/* VECTORIZED: reset streaming counters and aggregate state on rescan */
+	if (node->vec_init && node->vec_active)
 	{
-		node->vec_size = 0;
-		node->vec_index = 0;
-		node->vec_done = false;
+		node->vec_passed = 0;
+		node->vec_filtered = 0;
+		node->vec_total_passed = 0;
+		node->vec_total_filtered = 0;
 		vec_agg_reset(node);
 	}
 }

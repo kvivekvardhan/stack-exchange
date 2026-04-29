@@ -2,6 +2,7 @@ import { Route, Routes } from "react-router-dom";
 import Layout from "./components/Layout";
 import HomePage from "./pages/HomePage";
 import BenchmarkPage from "./pages/BenchmarkPage";
+import QueryInspectorPage from "./pages/QueryInspectorPage";
 import QuestionPage from "./pages/QuestionPage";
 import QuestionsPage from "./pages/QuestionsPage";
 import TagsPage from "./pages/TagsPage";
@@ -16,6 +17,7 @@ export default function App() {
           <Route path="/questions" element={<QuestionsPage />} />
           <Route path="/tags" element={<TagsPage />} />
           <Route path="/benchmark" element={<BenchmarkPage />} />
+          <Route path="/inspector" element={<QueryInspectorPage />} />
           <Route path="/question/:id" element={<QuestionPage />} />
         </Routes>
       </Layout>
