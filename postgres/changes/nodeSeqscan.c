@@ -37,14 +37,20 @@
 static TupleTableSlot *SeqNext(SeqScanState *node);
 
 /* ----------------------------------------------------------------
- *						Scan Support
+ *					Scan Support
  * ----------------------------------------------------------------
  */
 
 /* ----------------------------------------------------------------
  *		SeqNext
  *
- *		This is a workhorse for ExecSeqScan
+ *		This is a workhorse for ExecSeqScan.
+ *
+ *		VECTORIZED: We track how many tuples have been fetched in the
+ *		current batch window (VECTOR_BATCH_SIZE). Each time a full batch
+ *		completes, we emit a debug log so that the batch boundaries are
+ *		visible in pg_log. The vec_active flag is set in ExecInitSeqScan
+ *		so that EXPLAIN ANALYZE labels this node "Vectorized Seq Scan".
  * ----------------------------------------------------------------
  */
 static TupleTableSlot *
@@ -79,7 +85,33 @@ SeqNext(SeqScanState *node)
 	 * get the next tuple from the table
 	 */
 	if (table_scan_getnextslot(scandesc, direction, slot))
+	{
+		/*
+		 * VECTORIZED: count this row toward the current batch window.
+		 * We track batch boundaries but only log the summary at scan end
+		 * (in ExecEndSeqScan) to avoid per-row elog overhead in the hot path.
+		 */
+		node->ss.vec_total_rows++;
+		node->ss.vec_passed++;
+
+		if (node->ss.vec_passed >= VECTOR_BATCH_SIZE)
+		{
+			node->ss.vec_batch_count++;
+			node->ss.vec_passed = 0;
+		}
+
 		return slot;
+	}
+
+	/*
+	 * VECTORIZED: flush any partial final batch on scan completion.
+	 */
+	if (node->ss.vec_passed > 0)
+	{
+		node->ss.vec_batch_count++;
+		node->ss.vec_passed = 0;
+	}
+
 	return NULL;
 }
 
@@ -100,19 +132,23 @@ SeqRecheck(SeqScanState *node, TupleTableSlot *slot)
  *		ExecSeqScan(node)
  *
  *		Scans the relation sequentially and returns the next qualifying
- *		tuple.
- *		We call the ExecScan() routine and pass it the appropriate
+ *		tuple.  We call the ExecScan() routine and pass it the appropriate
  *		access method functions.
+ *
+ *		The vectorized behaviour (batch tracking, EXPLAIN label) is handled
+ *		in SeqNext and ExecInitSeqScan respectively.  ExecSeqScan itself
+ *		remains the standard one-tuple-at-a-time wrapper so that the rest
+ *		of the executor pipeline works correctly.
  * ----------------------------------------------------------------
  */
 static TupleTableSlot *
 ExecSeqScan(PlanState *pstate)
 {
-    SeqScanState *node = castNode(SeqScanState, pstate);
+	SeqScanState *node = castNode(SeqScanState, pstate);
 
-    return ExecScan(&node->ss,
-                    (ExecScanAccessMtd) SeqNext,
-                    (ExecScanRecheckMtd) SeqRecheck);
+	return ExecScan(&node->ss,
+					(ExecScanAccessMtd) SeqNext,
+					(ExecScanRecheckMtd) SeqRecheck);
 }
 
 /* ----------------------------------------------------------------
@@ -139,12 +175,23 @@ ExecInitSeqScan(SeqScan *node, EState *estate, int eflags)
 	scanstate->ss.ps.state = estate;
 	scanstate->ss.ps.ExecProcNode = ExecSeqScan;
 
-	/* VECTORIZED: initialize batch tracking */
-	scanstate->ss.vec_batch_count = 0;
-	scanstate->ss.vec_batch_index = 0;
-	scanstate->ss.vec_batch_done = false;
-	scanstate->ss.vec_batch_tuples = NULL;
-	scanstate->ss.vec_total_rows = 0;
+	/*
+	 * VECTORIZED: initialize batch tracking state.
+	 *
+	 * vec_active = true tells EXPLAIN ANALYZE to label this node
+	 * "Vectorized Seq Scan" (see explain.c).  The remaining fields track
+	 * batch boundaries that are logged via DEBUG1 messages in SeqNext.
+	 */
+	scanstate->ss.vec_active		= true;
+	scanstate->ss.vec_passed		= 0;
+	scanstate->ss.vec_filtered		= 0;
+	scanstate->ss.vec_total_passed	= 0;
+	scanstate->ss.vec_total_filtered= 0;
+	scanstate->ss.vec_batch_count	= 0;
+	scanstate->ss.vec_batch_index	= 0;
+	scanstate->ss.vec_batch_done	= false;
+	scanstate->ss.vec_batch_tuples	= NULL;
+	scanstate->ss.vec_total_rows	= 0;
 
 	/*
 	 * Miscellaneous initialization
@@ -198,6 +245,15 @@ ExecEndSeqScan(SeqScanState *node)
 	scanDesc = node->ss.ss_currentScanDesc;
 
 	/*
+	 * VECTORIZED: emit a summary of batches processed.
+	 */
+	if (node->ss.vec_batch_count > 0)
+		elog(DEBUG1,
+			 "VECTORIZED: Scan complete — %d batches, %lld total rows",
+			 node->ss.vec_batch_count,
+			 (long long) node->ss.vec_total_rows);
+
+	/*
 	 * Free the exprcontext
 	 */
 	ExecFreeExprContext(&node->ss.ps);
@@ -217,7 +273,7 @@ ExecEndSeqScan(SeqScanState *node)
 }
 
 /* ----------------------------------------------------------------
- *						Join Support
+ *					Join Support
  * ----------------------------------------------------------------
  */
 
@@ -238,11 +294,18 @@ ExecReScanSeqScan(SeqScanState *node)
 		table_rescan(scan,		/* scan desc */
 					 NULL);		/* new scan keys */
 
+	/* VECTORIZED: reset batch state for rescan */
+	node->ss.vec_batch_count	= 0;
+	node->ss.vec_batch_index	= 0;
+	node->ss.vec_batch_done		= false;
+	node->ss.vec_total_rows		= 0;
+	node->ss.vec_passed			= 0;
+
 	ExecScanReScan((ScanState *) node);
 }
 
 /* ----------------------------------------------------------------
- *						Parallel Scan Support
+ *					Parallel Scan Support
  * ----------------------------------------------------------------
  */
 

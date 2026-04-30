@@ -2,10 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import { inspectQuery } from "../api";
 
 const EXAMPLE_QUERIES = [
-  "SELECT COUNT(*) FROM posts WHERE view_count > 100",
-  "SELECT post_type_id, AVG(score) FROM posts WHERE view_count > 100 GROUP BY post_type_id",
-  "SELECT post_type_id, AVG(score), COUNT(*) FROM posts WHERE view_count > 500 GROUP BY post_type_id",
-  "SELECT AVG(score) FROM posts WHERE view_count > 1000"
+  "SELECT COUNT(*) FROM posts WHERE viewcount > 100",
+  "SELECT posttypeid, AVG(score) FROM posts WHERE viewcount > 100 GROUP BY posttypeid",
+  "SELECT posttypeid, AVG(score), COUNT(*) FROM posts WHERE viewcount > 500 GROUP BY posttypeid",
+  "SELECT AVG(score) FROM posts WHERE score > 10"
 ];
 
 function PlanNode({ line, index }) {
@@ -69,37 +69,32 @@ export default function QueryInspectorPage() {
     };
   }, []);
 
-  async function handleRun(e) {
-    e.preventDefault();
-    if (!sql.trim()) return;
-    if (abortRef.current) {
-      abortRef.current.abort();
-    }
+  async function runInspect(querySql) {
+    const trimmed = (querySql || sql).trim();
+    if (!trimmed) return;
+    if (abortRef.current) abortRef.current.abort();
     const controller = new AbortController();
     abortRef.current = controller;
 
     setLoading(true);
     setError("");
     try {
-      const response = await inspectQuery(sql.trim(), { signal: controller.signal });
-      if (abortRef.current !== controller) {
-        return;
-      }
+      const response = await inspectQuery(trimmed, { signal: controller.signal });
+      if (abortRef.current !== controller) return;
       setResult(response);
     } catch (err) {
-      if (err?.name === "AbortError") {
-        return;
-      }
-      if (abortRef.current !== controller) {
-        return;
-      }
+      if (err?.name === "AbortError") return;
+      if (abortRef.current !== controller) return;
       setError(err.message);
       setResult(null);
     } finally {
-      if (abortRef.current === controller) {
-        setLoading(false);
-      }
+      if (abortRef.current === controller) setLoading(false);
     }
+  }
+
+  function handleRun(e) {
+    e.preventDefault();
+    runInspect(sql);
   }
 
   const baseline = result?.data?.baseline;
@@ -135,7 +130,7 @@ export default function QueryInspectorPage() {
                 key={i}
                 type="button"
                 className="example-btn"
-                onClick={() => setSql(q)}
+                onClick={() => { setSql(q); runInspect(q); }}
                 title={q}
               >
                 Q{i + 1}
@@ -171,8 +166,8 @@ export default function QueryInspectorPage() {
                 <h4>Baseline</h4>
                 <div className="scan-stats">
                   <div className="scan-stat">
-                    <span className="scan-stat-label">Rows</span>
-                    <span className="scan-stat-value">{(baseline.rowCount || 0).toLocaleString()}</span>
+                    <span className="scan-stat-label">Rows Scanned</span>
+                    <span className="scan-stat-value">{(baseline.estimatedRows ?? baseline.rowCount ?? 0).toLocaleString()}</span>
                   </div>
                   <div className="scan-stat">
                     <span className="scan-stat-label">Scan</span>
@@ -181,7 +176,7 @@ export default function QueryInspectorPage() {
                 </div>
                 {baseline.filteredRows != null && (
                   <FilterMeter
-                    passed={baseline.rowCount || 0}
+                    passed={baseline.estimatedRows || 0}
                     filtered={baseline.filteredRows || 0}
                   />
                 )}
@@ -196,8 +191,8 @@ export default function QueryInspectorPage() {
                 </h4>
                 <div className="scan-stats">
                   <div className="scan-stat">
-                    <span className="scan-stat-label">Rows</span>
-                    <span className="scan-stat-value">{(vectorized.rowCount || 0).toLocaleString()}</span>
+                    <span className="scan-stat-label">Rows Scanned</span>
+                    <span className="scan-stat-value">{(vectorized.estimatedRows ?? vectorized.rowCount ?? 0).toLocaleString()}</span>
                   </div>
                   <div className="scan-stat">
                     <span className="scan-stat-label">Scan</span>
@@ -206,7 +201,7 @@ export default function QueryInspectorPage() {
                 </div>
                 {vectorized.filteredRows != null && (
                   <FilterMeter
-                    passed={vectorized.rowCount || 0}
+                    passed={vectorized.estimatedRows || 0}
                     filtered={vectorized.filteredRows || 0}
                   />
                 )}

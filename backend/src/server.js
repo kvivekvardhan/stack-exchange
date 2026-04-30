@@ -179,21 +179,32 @@ function mapSearchQuestion(row) {
 }
 
 async function runQuery(engine, sql, params = [], options = {}) {
-  const start = process.hrtime.bigint();
-  const result = await queryWithEngine(engine, sql, params);
-  const timingMs = Number(hrtimeToMs(start).toFixed(3));
+  return withTransactionEngine(engine, async (client) => {
+    // For the vectorized engine, disable parallel workers so the query always
+    // uses the single-process Vectorized Seq Scan path (not Parallel Seq Scan
+    // which bypasses our custom batch execution).
+    if (engine === "vectorized") {
+      await client.query("SET LOCAL max_parallel_workers_per_gather = 0");
+    }
 
-  let plan = null;
-  if (options.inspect) {
-    const explainResult = await queryWithEngine(
-      engine,
-      `EXPLAIN (FORMAT TEXT) ${sql}`,
-      params
-    );
-    plan = explainResult.rows.map((row) => row["QUERY PLAN"]).join("\n");
-  }
+    const start = process.hrtime.bigint();
+    const result = await client.query(sql, params);
+    const timingMs = Number(hrtimeToMs(start).toFixed(3));
 
-  return { result, timingMs, plan };
+    let plan = null;
+    if (options.inspect) {
+      if (engine === "vectorized") {
+        await client.query("SET LOCAL max_parallel_workers_per_gather = 0");
+      }
+      const explainResult = await client.query(
+        `EXPLAIN (FORMAT TEXT) ${sql}`,
+        params
+      );
+      plan = explainResult.rows.map((row) => row["QUERY PLAN"]).join("\n");
+    }
+
+    return { result, timingMs, plan };
+  });
 }
 
 async function questionExists(engine, questionId) {
@@ -993,7 +1004,13 @@ app.post(
     async function inspectEngine(engine) {
       return withTransactionEngine(engine, async (client) => {
         await client.query("SET TRANSACTION READ ONLY");
-        await client.query(`SET LOCAL statement_timeout = ${Number(INSPECT_TIMEOUT)}`);
+        // Use a generous timeout for EXPLAIN ANALYZE on large tables
+        await client.query("SET LOCAL statement_timeout = 60000");
+        // Disable parallel workers so we see clean single-process plans
+        // and the Vectorized Seq Scan path is always taken (not Parallel Seq Scan)
+        await client.query("SET LOCAL max_parallel_workers_per_gather = 0");
+        await client.query("SET LOCAL enable_indexscan = off");
+        await client.query("SET LOCAL enable_bitmapscan = off");
 
         const start = process.hrtime.bigint();
         let result, error = null;
@@ -1026,10 +1043,27 @@ app.post(
           } catch (_) {}
         }
 
-        // Parse vectorized scan info from plan text
+        // Parse vectorized scan info from plan text — line by line for reliability
         const isVectorized = plan ? plan.includes("Vectorized Seq Scan") : false;
-        const rowsMatch = plan ? plan.match(/rows=(\d+)/) : null;
-        const filterMatch = plan ? plan.match(/Rows Removed by Filter:\s*(\d+)/) : null;
+
+        let estimatedRows = null;
+        let filteredRows = null;
+
+        if (plan) {
+          const lines = plan.split("\n");
+          for (const line of lines) {
+            // Find the seq scan node line: "-> Vectorized Seq Scan ... (actual time=... rows=NNN loops=1)"
+            if (/(?:Vectorized Seq Scan|Seq Scan)\s+on\s+\w+/.test(line)) {
+              // actual rows returned by the scan after filter
+              const rowsM = line.match(/actual time[^)]*rows=(\d+)/);
+              if (rowsM) estimatedRows = parseInt(rowsM[1], 10);
+              // filter removal count on the NEXT line
+            }
+            // Rows Removed by Filter — always on its own line
+            const filterM = line.match(/Rows Removed by Filter:\s*(\d+)/);
+            if (filterM) filteredRows = parseInt(filterM[1], 10);
+          }
+        }
 
         return {
           engine,
@@ -1039,7 +1073,7 @@ app.post(
           plan,
           planJson,
           isVectorized,
-          estimatedRows: rowsMatch ? parseInt(rowsMatch[1], 10) : null,
+          estimatedRows: actualRowsMatch ? parseInt(actualRowsMatch[1], 10) : null,
           filteredRows: filterMatch ? parseInt(filterMatch[1], 10) : null
         };
       });
