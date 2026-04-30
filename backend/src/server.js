@@ -1073,8 +1073,8 @@ app.post(
           plan,
           planJson,
           isVectorized,
-          estimatedRows: actualRowsMatch ? parseInt(actualRowsMatch[1], 10) : null,
-          filteredRows: filterMatch ? parseInt(filterMatch[1], 10) : null
+          estimatedRows: estimatedRows,
+          filteredRows: filteredRows
         };
       });
     }

@@ -17,15 +17,10 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "executor/tuptable.h"
 
 #include "executor/executor.h"
 #include "miscadmin.h"
-#include "catalog/pg_type_d.h"
-#include "utils/rel.h"
 #include "utils/memutils.h"
-
-#include <string.h>
 
 
 
@@ -166,375 +161,106 @@ ExecScanFetch(ScanState *node,
  *			 "cursor" is positioned before the first qualifying tuple.
  * ----------------------------------------------------------------
  */
-/*
- * VECTORIZED: target-relation classifier.
- *
- * VEC_REL_POSTS    — relation has all of (PostTypeId, Score, ViewCount?) of a
- *                    vectorizable type. Inline filter + side-channel
- *                    aggregation are enabled.
- * VEC_REL_NONE     — relation is not a vectorization target; the engine
- *                    falls back to standard volcano execution.
- *
- * Detection is purely catalog-driven: we walk the scan tuple descriptor,
- * look up columns by *name*, and validate their type against an allow-list.
- * No hardcoded attribute indices, no fixed natts count, no name strcmp on
- * the relation itself — any user table that exposes the required columns
- * with compatible types qualifies. Relation OID is cached on match so
- * subsequent rescans skip re-detection.
- */
-typedef enum VecRelationKind
-{
-    VEC_REL_NONE = 0,
-    VEC_REL_POSTS
-} VecRelationKind;
-
-#define VEC_BATCH_SIZE      1000
-#define VEC_AGG_INIT_CAP      16
-
-/*
- * VECTORIZED helper: locate an attribute by name from a TupleDesc and verify
- * its declared type is in an allow-list of vectorizable types. Returns
- * InvalidAttrNumber (0) if not found, dropped, or type-incompatible.
- *
- * The lookup is case-sensitive against pg_attribute.attname, which is the
- * post-fold lowercased identifier (so "PostTypeId" in DDL → "posttypeid"
- * in the catalog unless quoted).
- */
-static AttrNumber
-vec_get_attno_by_name(TupleDesc desc, const char *name,
-                      const Oid *allowed_types, int n_types)
-{
-    int i, j;
-
-    if (desc == NULL || name == NULL)
-        return InvalidAttrNumber;
-
-    for (i = 0; i < desc->natts; i++)
-    {
-        Form_pg_attribute attr = TupleDescAttr(desc, i);
-        if (attr->attisdropped)
-            continue;
-        if (strcmp(NameStr(attr->attname), name) != 0)
-            continue;
-        for (j = 0; j < n_types; j++)
-        {
-            if (attr->atttypid == allowed_types[j])
-                return (AttrNumber) (i + 1);
-        }
-        /* Found by name but type is not vectorizable. */
-        return InvalidAttrNumber;
-    }
-    return InvalidAttrNumber;
-}
-
-/*
- * VECTORIZED helper: try several candidate attribute names (e.g. CamelCase
- * "posttypeid" and snake_case "post_type_id") and return the first hit.
- */
-static AttrNumber
-vec_get_attno_by_names(TupleDesc desc, const char * const *names, int n_names,
-                       const Oid *allowed_types, int n_types)
-{
-    int i;
-
-    for (i = 0; i < n_names; i++)
-    {
-        AttrNumber a = vec_get_attno_by_name(desc, names[i], allowed_types, n_types);
-        if (AttributeNumberIsValid(a))
-            return a;
-    }
-    return InvalidAttrNumber;
-}
-
-/*
- * VECTORIZED: classify the scan's relation by probing its TupleDesc for the
- * Posts-shaped columns. On a match the resolved attnos and OID are cached on
- * the ScanState so all subsequent fetches use the dynamic mapping with no
- * further lookups.
- */
-static VecRelationKind
-vec_detect_target_relation(ScanState *node)
-{
-    TupleDesc desc;
-    AttrNumber pt, sc, vc;
-    static const Oid int_types[] = { INT4OID, INT8OID };
-    static const char * const posttype_names[]  = { "posttypeid", "post_type_id" };
-    static const char * const viewcount_names[] = { "viewcount",  "view_count"   };
-
-    /* Reset cache so a rescan with a swapped descriptor can't reuse stale state. */
-    node->vec_target_oid    = InvalidOid;
-    node->vec_att_posttype  = InvalidAttrNumber;
-    node->vec_att_score     = InvalidAttrNumber;
-    node->vec_att_viewcount = InvalidAttrNumber;
-
-    if (node->ss_currentRelation == NULL)
-        return VEC_REL_NONE;
-
-    desc = node->ss_ScanTupleSlot->tts_tupleDescriptor;
-    if (desc == NULL)
-        return VEC_REL_NONE;
-
-    pt = vec_get_attno_by_names(desc, posttype_names, lengthof(posttype_names),
-                                int_types, lengthof(int_types));
-    sc = vec_get_attno_by_name (desc, "score",
-                                int_types, lengthof(int_types));
-    vc = vec_get_attno_by_names(desc, viewcount_names, lengthof(viewcount_names),
-                                int_types, lengthof(int_types));
-
-    /*
-     * Required columns for the vectorized aggregate path. ViewCount is
-     * optional — if absent we still vectorize the scan/agg, we just don't
-     * have the column for the optional inline pre-filter.
-     */
-    if (!AttributeNumberIsValid(pt) || !AttributeNumberIsValid(sc))
-        return VEC_REL_NONE;
-
-    node->vec_att_posttype  = pt;
-    node->vec_att_score     = sc;
-    node->vec_att_viewcount = vc;
-    node->vec_target_oid    = RelationGetRelid(node->ss_currentRelation);
-
-    return VEC_REL_POSTS;
-}
-
-static inline void
-vec_agg_reset(ScanState *node)
-{
-    node->vec_agg_ngroups = 0;
-    node->vec_agg_logged = false;
-}
-
-static int
-vec_agg_find_or_add_group(ScanState *node, int32 key)
-{
-    int i;
-
-    for (i = 0; i < node->vec_agg_ngroups; i++)
-    {
-        if (node->vec_agg_keys[i] == key)
-            return i;
-    }
-
-    if (node->vec_agg_ngroups >= node->vec_agg_cap)
-    {
-        int newcap = (node->vec_agg_cap <= 0) ? VEC_AGG_INIT_CAP : node->vec_agg_cap * 2;
-        node->vec_agg_keys = (int32 *) repalloc(node->vec_agg_keys, newcap * sizeof(int32));
-        node->vec_agg_sum_i64 = (int64 *) repalloc(node->vec_agg_sum_i64, newcap * sizeof(int64));
-        node->vec_agg_count = (int64 *) repalloc(node->vec_agg_count, newcap * sizeof(int64));
-        memset(node->vec_agg_sum_i64 + node->vec_agg_cap, 0, (newcap - node->vec_agg_cap) * sizeof(int64));
-        memset(node->vec_agg_count + node->vec_agg_cap, 0, (newcap - node->vec_agg_cap) * sizeof(int64));
-        node->vec_agg_cap = newcap;
-    }
-
-    i = node->vec_agg_ngroups++;
-    node->vec_agg_keys[i] = key;
-    node->vec_agg_sum_i64[i] = 0;
-    node->vec_agg_count[i] = 0;
-    return i;
-}
-
 TupleTableSlot *
 ExecScan(ScanState *node,
-         ExecScanAccessMtd accessMtd,
-         ExecScanRecheckMtd recheckMtd)
+		 ExecScanAccessMtd accessMtd,	/* function returning a tuple */
+		 ExecScanRecheckMtd recheckMtd)
 {
-    ExprContext    *econtext;
-    ExprState      *qual;
-    ProjectionInfo *projInfo;
+	ExprContext *econtext;
+	ExprState  *qual;
+	ProjectionInfo *projInfo;
 
-    qual     = node->ps.qual;
-    projInfo = node->ps.ps_ProjInfo;
-    econtext = node->ps.ps_ExprContext;
+	/*
+	 * Fetch data from node
+	 */
+	qual = node->ps.qual;
+	projInfo = node->ps.ps_ProjInfo;
+	econtext = node->ps.ps_ExprContext;
 
-    /* VECTORIZED: one-time init — cache activation decision and allocate state. */
-    if (!node->vec_init)
-    {
-        const char *pg_vec = getenv("PG_VECTORIZED");
-        VecRelationKind relkind = vec_detect_target_relation(node);
+	/* interrupt checks are in ExecScanFetch */
 
-        /*
-         * Activation requires both the env opt-in AND a positive catalog
-         * match. If detection failed, we leave vec_active=false and the
-         * volcano fallback at the bottom of the loop runs unmodified —
-         * this is the safety fallback required by the design.
-         */
-        node->vec_active = (pg_vec != NULL &&
-                            strcmp(pg_vec, "1") == 0 &&
-                            relkind != VEC_REL_NONE);
-        node->vec_init = true;
+	/*
+	 * If we have neither a qual to check nor a projection to do, just skip
+	 * all the overhead and return the raw scan tuple.
+	 */
+	if (!qual && !projInfo)
+	{
+		ResetExprContext(econtext);
+		return ExecScanFetch(node, accessMtd, recheckMtd);
+	}
 
-        if (node->vec_active)
-        {
-            /*
-             * Aggregate side-channel is enabled whenever we matched a Posts-
-             * shaped relation: PostTypeId+Score were proven present and INT4
-             * by vec_detect_target_relation.
-             */
-            node->vec_agg_keys    = (int32 *) palloc(VEC_AGG_INIT_CAP * sizeof(int32));
-            node->vec_agg_sum_i64 = (int64 *) palloc0(VEC_AGG_INIT_CAP * sizeof(int64));
-            node->vec_agg_count   = (int64 *) palloc0(VEC_AGG_INIT_CAP * sizeof(int64));
-            node->vec_agg_ngroups = 0;
-            node->vec_agg_cap     = VEC_AGG_INIT_CAP;
-            node->vec_agg_enabled = true;
-            node->vec_agg_logged  = false;
+	/*
+	 * Reset per-tuple memory context to free any expression evaluation
+	 * storage allocated in the previous tuple cycle.
+	 */
+	ResetExprContext(econtext);
 
-            node->vec_passed = 0;
-            node->vec_filtered = 0;
-            node->vec_total_passed = 0;
-            node->vec_total_filtered = 0;
-            node->vec_batch_count = 0;
-            node->vec_batch_index = 0;
-            node->vec_batch_done  = false;
-            node->vec_batch_tuples = (HeapTuple *) palloc(VEC_BATCH_SIZE * sizeof(HeapTuple));
-        }
-    }
+	/*
+	 * get a tuple from the access method.  Loop until we obtain a tuple that
+	 * passes the qualification.
+	 */
+	for (;;)
+	{
+		TupleTableSlot *slot;
 
-    for (;;)
-    {
-        /* VECTORIZED: bypass volcano loop and use internal batch processor if active */
-        if (node->vec_active)
-        {
-            /* If current batch is exhausted, fetch and process a new batch */
-            if (node->vec_batch_index >= node->vec_batch_count && !node->vec_batch_done)
-            {
-                int i;
-                node->vec_batch_index = 0;
-                node->vec_batch_count = 0;
+		slot = ExecScanFetch(node, accessMtd, recheckMtd);
 
-                /* 1. Batch Fetch Phase */
-                for (i = 0; i < VEC_BATCH_SIZE; i++)
-                {
-                    TupleTableSlot *raw = ExecScanFetch(node, accessMtd, recheckMtd);
-                    if (TupIsNull(raw))
-                    {
-                        node->vec_batch_done = true;
-                        break;
-                    }
-                    /* Store tuple in our batch buffer */
-                    node->vec_batch_tuples[node->vec_batch_count++] = ExecCopySlotHeapTuple(raw);
-                }
+		/*
+		 * if the slot returned by the accessMtd contains NULL, then it means
+		 * there is nothing more to scan so we just return an empty slot,
+		 * being careful to use the projection result slot so it has correct
+		 * tupleDesc.
+		 */
+		if (TupIsNull(slot))
+		{
+			if (projInfo)
+				return ExecClearTuple(projInfo->pi_state.resultslot);
+			else
+				return slot;
+		}
 
-                /* 2. Vectorized Processing Phase */
-                for (i = 0; i < node->vec_batch_count; i++)
-                {
-                    HeapTuple   tup = node->vec_batch_tuples[i];
-                    TupleDesc   tdesc = node->ss_ScanTupleSlot->tts_tupleDescriptor;
-                    bool        pass = true;
+		/*
+		 * place the current tuple into the expr context
+		 */
+		econtext->ecxt_scantuple = slot;
 
-                    ResetExprContext(econtext);
+		/*
+		 * check that the current tuple satisfies the qual-clause
+		 *
+		 * check for non-null qual here to avoid a function call to ExecQual()
+		 * when the qual is null ... saves only a few cycles, but they add up
+		 * ...
+		 */
+		if (qual == NULL || ExecQual(qual, econtext))
+		{
+			/*
+			 * Found a satisfactory scan tuple.
+			 */
+			if (projInfo)
+			{
+				/*
+				 * Form a projection tuple, store it in the result tuple slot
+				 * and return it.
+				 */
+				return ExecProject(projInfo);
+			}
+			else
+			{
+				/*
+				 * Here, we aren't projecting, so just return scan tuple.
+				 */
+				return slot;
+			}
+		}
+		else
+			InstrCountFiltered1(node, 1);
 
-                    /*
-                     * Run ExecQual on the materialized tuple. ExecQual is the
-                     * single source of truth for filter semantics — we no
-                     * longer apply a hardcoded inline short-circuit because
-                     * that depended on a benchmark-specific qual shape and is
-                     * unsafe under arbitrary user predicates.
-                     */
-                    if (qual != NULL)
-                    {
-                        ExecForceStoreHeapTuple(tup, node->ss_ScanTupleSlot, false);
-                        econtext->ecxt_scantuple = node->ss_ScanTupleSlot;
-                        pass = ExecQual(qual, econtext);
-                        ExecClearTuple(node->ss_ScanTupleSlot);
-                    }
-
-                    if (!pass)
-                    {
-                        heap_freetuple(tup);
-                        node->vec_batch_tuples[i] = NULL;
-                        node->vec_filtered++;
-                        node->vec_total_filtered++;
-                        InstrCountFiltered1(node, 1);
-                        continue;
-                    }
-
-                    /* Passed filter/qual. */
-                    node->vec_passed++;
-                    node->vec_total_passed++;
-
-                    /*
-                     * Side-channel aggregate: GROUP BY PostTypeId, SUM(Score),
-                     * COUNT(*). Uses dynamically-resolved attnos cached on
-                     * the ScanState — no hardcoded column indices.
-                     */
-                    if (node->vec_agg_enabled &&
-                        AttributeNumberIsValid(node->vec_att_posttype) &&
-                        AttributeNumberIsValid(node->vec_att_score))
-                    {
-                        bool  isnull;
-                        Datum d = heap_getattr(tup, node->vec_att_posttype, tdesc, &isnull);
-                        int32 type_id = isnull ? 0 : DatumGetInt32(d);
-
-                        if (!isnull)
-                        {
-                            int   gidx = vec_agg_find_or_add_group(node, type_id);
-                            Datum score_d = heap_getattr(tup, node->vec_att_score, tdesc, &isnull);
-                            if (!isnull)
-                                node->vec_agg_sum_i64[gidx] += (int64) DatumGetInt32(score_d);
-                            node->vec_agg_count[gidx]++;
-                        }
-                    }
-                }
-            }
-
-            /* 3. Yield Phase: return tuples from the processed batch one-by-one */
-            while (node->vec_batch_index < node->vec_batch_count)
-            {
-                HeapTuple tup = node->vec_batch_tuples[node->vec_batch_index++];
-                if (tup != NULL)
-                {
-                    ExecForceStoreHeapTuple(tup, node->ss_ScanTupleSlot, true); /* Will be freed by ExecClearTuple */
-                    econtext->ecxt_scantuple = node->ss_ScanTupleSlot;
-                    
-                    if (projInfo)
-                        return ExecProject(projInfo);
-                    return node->ss_ScanTupleSlot;
-                }
-            }
-
-            if (node->vec_batch_done)
-            {
-                /* Scan complete — log aggregate results */
-                if (node->vec_agg_enabled && !node->vec_agg_logged)
-                {
-                    int i;
-                    for (i = 0; i < node->vec_agg_ngroups; i++)
-                    {
-                        if (node->vec_agg_count[i] == 0) continue;
-                        elog(LOG, "VECTORIZED AGG: PostType=%d avg_score=%.4f count=" INT64_FORMAT,
-                             node->vec_agg_keys[i],
-                             (double) node->vec_agg_sum_i64[i] / (double) node->vec_agg_count[i],
-                             node->vec_agg_count[i]);
-                    }
-                    elog(LOG, "VECTORIZED SCAN TOTAL: " INT64_FORMAT " passed, " INT64_FORMAT " filtered",
-                         node->vec_total_passed, node->vec_total_filtered);
-                    node->vec_agg_logged = true;
-                }
-                return NULL;
-            }
-            continue;
-        }
-
-        /* Volcano Execution (Fallback for non-vectorized queries) */
-        TupleTableSlot *slot = ExecScanFetch(node, accessMtd, recheckMtd);
-        ResetExprContext(econtext);
-        
-        if (TupIsNull(slot)) return NULL;
-
-        econtext->ecxt_scantuple = slot;
-        if (qual == NULL || ExecQual(qual, econtext))
-        {
-            if (projInfo)
-                return ExecProject(projInfo);
-            return slot;
-        }
-        else
-        {
-            InstrCountFiltered1(node, 1);
-        }
-    }
+		/*
+		 * Tuple fails qual, so free per-tuple memory and try again.
+		 */
+		ResetExprContext(econtext);
+	}
 }
-
 
 /*
  * ExecAssignScanProjectionInfo
@@ -624,18 +350,5 @@ ExecScanReScan(ScanState *node)
 					epqstate->epqExtra->relsubs_blocked[rtindex - 1];
 			}
 		}
-	}
-
-	/* VECTORIZED: reset streaming counters and aggregate state on rescan */
-	if (node->vec_init && node->vec_active)
-	{
-		node->vec_passed = 0;
-		node->vec_filtered = 0;
-		node->vec_total_passed = 0;
-		node->vec_total_filtered = 0;
-		node->vec_batch_count = 0;
-		node->vec_batch_index = 0;
-		node->vec_batch_done = false;
-		vec_agg_reset(node);
 	}
 }
