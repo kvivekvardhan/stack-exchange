@@ -18,7 +18,7 @@ sudo -u postgres psql
     # Expect output rows emitted by vectorized Agg passthrough for passenger_count 1..7
     tail -20 ~/pgdata/logfilepsql -p 5433 -d postgres -c "\timing on" -c "SELECT passenger_count, AVG(fare_amount), COUNT(*) FROM taxi_trips WHERE trip_distance > 5 GROUP BY passenger_count;"
 
-
+SELECT COUNT(*) FROM posts WHERE viewcount > 100
 3rd terminal
     pg_ctl -D ~/pgdata -l ~/pgdata/logfile -o "-p 5434" stop
     pg_ctl -D ~/pgdata -l ~/pgdata/logfile -o "-p 5434" start
@@ -30,3 +30,26 @@ sudo -u postgres psql
 
     psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -c "EXPLAIN SELECT * FROM taxi_trips WHERE trip_distance > 5;"
     psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -c "\timing on" -c "SELECT passenger_count, AVG(fare_amount), COUNT(*) FROM taxi_trips WHERE trip_distance > 5 GROUP BY passenger_count;"
+
+
+
+
+
+
+
+
+
+
+
+psql -p 5433 -d stackfast -c "EXPLAIN SELECT * FROM posts WHERE viewcount > 100 LIMIT 10;"
+
+psql -p 5433 -d stackfast -c "\timing on" -c "SELECT posttypeid, COUNT(*) FROM posts WHERE viewcount > 100 GROUP BY posttypeid ORDER BY posttypeid;"
+
+psql -p 5433 -d stackfast -c "SELECT COUNT(*) FROM posts WHERE viewcount > 100;" && tail -10 ~/pgdata_vec/logfile
+
+psql -p 5433 -d stackfast -c "SELECT id, title, score, viewcount FROM posts WHERE posttypeid = 1 ORDER BY score DESC LIMIT 5;"
+
+psql -p 5433 -d stackfast -c "\timing on" -c "SELECT posttypeid, AVG(score), COUNT(*) FROM posts WHERE viewcount > 100 GROUP BY posttypeid;"
+psql -h 127.0.0.1 -p 5432 -U postgres -d stackfast -c "\timing on" -c "SELECT posttypeid, AVG(score), COUNT(*) FROM posts WHERE viewcount > 100 GROUP BY posttypeid;"
+
+cd ~/Desktop/dbis_project && ./duckdb taxi.db -c "\timing on" -c "SELECT passenger_count, AVG(fare_amount), COUNT(*) FROM taxi_trips WHERE trip_distance > 5 GROUP BY passenger_count;"

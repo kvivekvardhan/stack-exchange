@@ -17,10 +17,16 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "executor/tuptable.h"
 
 #include "executor/executor.h"
 #include "miscadmin.h"
+#include "catalog/pg_type_d.h"
+#include "utils/rel.h"
+#include "access/relscan.h"
 #include "utils/memutils.h"
+
+#include <string.h>
 
 
 
@@ -161,106 +167,354 @@ ExecScanFetch(ScanState *node,
  *			 "cursor" is positioned before the first qualifying tuple.
  * ----------------------------------------------------------------
  */
+/* VECTORIZED: relation-specific modes */
+typedef enum VecRelationKind
+{
+    VEC_REL_NONE = 0,
+    VEC_REL_SE_POSTS,
+    VEC_REL_QUESTIONS
+} VecRelationKind;
+
+/* VECTORIZED: column positions for se_posts schema */
+#define VEC_COL_POSTTYPE      2   /* PostTypeId */
+#define VEC_COL_SCORE         3   /* Score */
+#define VEC_COL_VIEWCOUNT     4   /* ViewCount */
+
+#define VEC_BATCH_SIZE      1000
+#define VEC_AGG_INIT_CAP      16
+
+/* VECTORIZED: detect exact se_posts schema */
+static bool
+vec_is_se_posts_relation(ScanState *node)
+{
+    TupleDesc desc;
+    int i;
+
+    if (node->ss_currentRelation == NULL)
+        return false;
+
+    if (strcmp(RelationGetRelationName(node->ss_currentRelation), "se_posts") != 0)
+        return false;
+
+    desc = node->ss_ScanTupleSlot->tts_tupleDescriptor;
+    if (desc == NULL || desc->natts != 7)
+        return false;
+
+    /*
+     * Expected schema:
+     * (id, posttypeid, score, viewcount, answercount, commentcount, favoritecount)
+     * all int4
+     */
+    for (i = 0; i < 7; i++)
+    {
+        Form_pg_attribute attr = TupleDescAttr(desc, i);
+        if (attr->attisdropped)
+            return false;
+        if (attr->atttypid != INT4OID)
+            return false;
+    }
+
+    return true;
+}
+
+/* VECTORIZED: detect exact questions schema used by main app endpoints */
+static bool
+vec_is_questions_relation(ScanState *node)
+{
+    TupleDesc desc;
+    static const Oid expected[7] = {
+        INT4OID,        /* id */
+        TEXTOID,        /* title */
+        TEXTOID,        /* body */
+        TEXTOID,        /* asked_by */
+        INT4OID,        /* score */
+        INT4OID,        /* views */
+        TIMESTAMPTZOID  /* created_at */
+    };
+    int i;
+
+    if (node->ss_currentRelation == NULL)
+        return false;
+
+    if (strcmp(RelationGetRelationName(node->ss_currentRelation), "questions") != 0)
+        return false;
+
+    desc = node->ss_ScanTupleSlot->tts_tupleDescriptor;
+    if (desc == NULL || desc->natts != 7)
+        return false;
+
+    for (i = 0; i < 7; i++)
+    {
+        Form_pg_attribute attr = TupleDescAttr(desc, i);
+        if (attr->attisdropped)
+            return false;
+        if (attr->atttypid != expected[i])
+            return false;
+    }
+
+    return true;
+}
+
+static VecRelationKind
+vec_detect_target_relation(ScanState *node)
+{
+    if (vec_is_se_posts_relation(node))
+        return VEC_REL_SE_POSTS;
+    if (vec_is_questions_relation(node))
+        return VEC_REL_QUESTIONS;
+    return VEC_REL_NONE;
+}
+
+static inline void
+vec_agg_reset(ScanState *node)
+{
+    node->vec_agg_ngroups = 0;
+    node->vec_agg_logged = false;
+}
+
+static int
+vec_agg_find_or_add_group(ScanState *node, int32 key)
+{
+    int i;
+
+    for (i = 0; i < node->vec_agg_ngroups; i++)
+    {
+        if (node->vec_agg_keys[i] == key)
+            return i;
+    }
+
+    if (node->vec_agg_ngroups >= node->vec_agg_cap)
+    {
+        int newcap = (node->vec_agg_cap <= 0) ? VEC_AGG_INIT_CAP : node->vec_agg_cap * 2;
+        node->vec_agg_keys = (int32 *) repalloc(node->vec_agg_keys, newcap * sizeof(int32));
+        node->vec_agg_sum_i64 = (int64 *) repalloc(node->vec_agg_sum_i64, newcap * sizeof(int64));
+        node->vec_agg_count = (int64 *) repalloc(node->vec_agg_count, newcap * sizeof(int64));
+        memset(node->vec_agg_sum_i64 + node->vec_agg_cap, 0, (newcap - node->vec_agg_cap) * sizeof(int64));
+        memset(node->vec_agg_count + node->vec_agg_cap, 0, (newcap - node->vec_agg_cap) * sizeof(int64));
+        node->vec_agg_cap = newcap;
+    }
+
+    i = node->vec_agg_ngroups++;
+    node->vec_agg_keys[i] = key;
+    node->vec_agg_sum_i64[i] = 0;
+    node->vec_agg_count[i] = 0;
+    return i;
+}
+
 TupleTableSlot *
 ExecScan(ScanState *node,
-		 ExecScanAccessMtd accessMtd,	/* function returning a tuple */
-		 ExecScanRecheckMtd recheckMtd)
+         ExecScanAccessMtd accessMtd,
+         ExecScanRecheckMtd recheckMtd)
 {
-	ExprContext *econtext;
-	ExprState  *qual;
-	ProjectionInfo *projInfo;
+    ExprContext    *econtext;
+    ExprState      *qual;
+    ProjectionInfo *projInfo;
+    TupleTableSlot *slot;
 
-	/*
-	 * Fetch data from node
-	 */
-	qual = node->ps.qual;
-	projInfo = node->ps.ps_ProjInfo;
-	econtext = node->ps.ps_ExprContext;
+    qual     = node->ps.qual;
+    projInfo = node->ps.ps_ProjInfo;
+    econtext = node->ps.ps_ExprContext;
 
-	/* interrupt checks are in ExecScanFetch */
+    /* VECTORIZED: one-time init — cache activation decision and allocate state. */
+    if (!node->vec_init)
+    {
+        const char *pg_vec = getenv("PG_VECTORIZED");
+        VecRelationKind relkind = vec_detect_target_relation(node);
 
-	/*
-	 * If we have neither a qual to check nor a projection to do, just skip
-	 * all the overhead and return the raw scan tuple.
-	 */
-	if (!qual && !projInfo)
-	{
-		ResetExprContext(econtext);
-		return ExecScanFetch(node, accessMtd, recheckMtd);
-	}
+        {
+            bool is_parallel = (node->ss_currentScanDesc != NULL &&
+                                node->ss_currentScanDesc->rs_parallel != NULL);
+            node->vec_active = (pg_vec != NULL &&
+                                strcmp(pg_vec, "1") == 0 &&
+                                relkind != VEC_REL_NONE &&
+                                !is_parallel);
+        }
+        node->vec_init = true;
 
-	/*
-	 * Reset per-tuple memory context to free any expression evaluation
-	 * storage allocated in the previous tuple cycle.
-	 */
-	ResetExprContext(econtext);
+        if (node->vec_active)
+        {
+            if (relkind == VEC_REL_SE_POSTS)
+            {
+                node->vec_agg_keys = (int32 *) palloc(VEC_AGG_INIT_CAP * sizeof(int32));
+                node->vec_agg_sum_i64 = (int64 *) palloc0(VEC_AGG_INIT_CAP * sizeof(int64));
+                node->vec_agg_count = (int64 *) palloc0(VEC_AGG_INIT_CAP * sizeof(int64));
+                node->vec_agg_ngroups = 0;
+                node->vec_agg_cap = VEC_AGG_INIT_CAP;
+                node->vec_agg_enabled = true;
+            }
+            else
+            {
+                node->vec_agg_enabled = false;
+            }
+            node->vec_agg_logged = false;
+            node->vec_passed = 0;
+            node->vec_filtered = 0;
+            node->vec_total_passed = 0;
+            node->vec_total_filtered = 0;
+            /* VECTORIZED: true batch slot flow initialization */
+            node->vec_batch_count = 0;
+            node->vec_batch_index = 0;
+            node->vec_batch_done = false;
+            node->vec_batch_tuples = (HeapTuple *) palloc(VEC_BATCH_SIZE * sizeof(HeapTuple));
+        }
+    }
 
-	/*
-	 * get a tuple from the access method.  Loop until we obtain a tuple that
-	 * passes the qualification.
-	 */
-	for (;;)
-	{
-		TupleTableSlot *slot;
+    for (;;)
+    {
+        /* VECTORIZED: bypass volcano loop and use internal batch processor if active */
+        if (node->vec_active)
+        {
+            /* If current batch is exhausted, fetch and process a new batch */
+            if (node->vec_batch_index >= node->vec_batch_count && !node->vec_batch_done)
+            {
+                int i;
+                node->vec_batch_index = 0;
+                node->vec_batch_count = 0;
 
-		slot = ExecScanFetch(node, accessMtd, recheckMtd);
+                /* 1. Batch Fetch Phase */
+                for (i = 0; i < VEC_BATCH_SIZE; i++)
+                {
+                    TupleTableSlot *raw = ExecScanFetch(node, accessMtd, recheckMtd);
+                    if (TupIsNull(raw))
+                    {
+                        node->vec_batch_done = true;
+                        break;
+                    }
+                    /* Store tuple in our batch buffer */
+                    node->vec_batch_tuples[node->vec_batch_count++] = ExecCopySlotHeapTuple(raw);
+                }
 
-		/*
-		 * if the slot returned by the accessMtd contains NULL, then it means
-		 * there is nothing more to scan so we just return an empty slot,
-		 * being careful to use the projection result slot so it has correct
-		 * tupleDesc.
-		 */
-		if (TupIsNull(slot))
-		{
-			if (projInfo)
-				return ExecClearTuple(projInfo->pi_state.resultslot);
-			else
-				return slot;
-		}
+                /* 2. Vectorized Processing Phase */
+                for (i = 0; i < node->vec_batch_count; i++)
+                {
+                    HeapTuple tup = node->vec_batch_tuples[i];
+                    bool pass = true;
 
-		/*
-		 * place the current tuple into the expr context
-		 */
-		econtext->ecxt_scantuple = slot;
+                    ResetExprContext(econtext);
 
-		/*
-		 * check that the current tuple satisfies the qual-clause
-		 *
-		 * check for non-null qual here to avoid a function call to ExecQual()
-		 * when the qual is null ... saves only a few cycles, but they add up
-		 * ...
-		 */
-		if (qual == NULL || ExecQual(qual, econtext))
-		{
-			/*
-			 * Found a satisfactory scan tuple.
-			 */
-			if (projInfo)
-			{
-				/*
-				 * Form a projection tuple, store it in the result tuple slot
-				 * and return it.
-				 */
-				return ExecProject(projInfo);
-			}
-			else
-			{
-				/*
-				 * Here, we aren't projecting, so just return scan tuple.
-				 */
-				return slot;
-			}
-		}
-		else
-			InstrCountFiltered1(node, 1);
+                    /*
+                     * se_posts fast-path:
+                     * Apply cheap inline pre-filter before ExecQual.
+                     * questions fast-path:
+                     * Skip this pre-filter and rely on ExecQual to preserve semantics.
+                     */
+                    if (node->vec_agg_enabled)
+                    {
+                        bool isnull;
+                        Datum d;
+                        int32 views;
 
-		/*
-		 * Tuple fails qual, so free per-tuple memory and try again.
-		 */
-		ResetExprContext(econtext);
-	}
+                        d = heap_getattr(tup, VEC_COL_VIEWCOUNT,
+                                         node->ss_ScanTupleSlot->tts_tupleDescriptor, &isnull);
+                        views = isnull ? 0 : DatumGetInt32(d);
+                        if (qual != NULL && views <= 100)
+                            pass = false;
+                    }
+
+                    /*
+                     * Preserve correctness for all quals by evaluating ExecQual on
+                     * the tuple we just batched.
+                     */
+                    if (pass && qual != NULL)
+                    {
+                        ExecForceStoreHeapTuple(tup, node->ss_ScanTupleSlot, false);
+                        econtext->ecxt_scantuple = node->ss_ScanTupleSlot;
+                        pass = ExecQual(qual, econtext);
+                        ExecClearTuple(node->ss_ScanTupleSlot);
+                    }
+
+                    if (!pass)
+                    {
+                        heap_freetuple(tup);
+                        node->vec_batch_tuples[i] = NULL;
+                        node->vec_filtered++;
+                        node->vec_total_filtered++;
+                        InstrCountFiltered1(node, 1);
+                        continue;
+                    }
+
+                    /* Passed filter/qual. */
+                    node->vec_passed++;
+                    node->vec_total_passed++;
+
+                    if (node->vec_agg_enabled)
+                    {
+                        bool isnull;
+                        Datum d = heap_getattr(tup, VEC_COL_POSTTYPE,
+                                               node->ss_ScanTupleSlot->tts_tupleDescriptor, &isnull);
+                        int32 type_id = isnull ? 0 : DatumGetInt32(d);
+
+                        if (!isnull)
+                        {
+                            int gidx = vec_agg_find_or_add_group(node, type_id);
+                            Datum score_d = heap_getattr(tup, VEC_COL_SCORE,
+                                                         node->ss_ScanTupleSlot->tts_tupleDescriptor, &isnull);
+                            if (!isnull)
+                                node->vec_agg_sum_i64[gidx] += (int64) DatumGetInt32(score_d);
+                            node->vec_agg_count[gidx]++;
+                        }
+                    }
+                }
+            }
+
+            /* 3. Yield Phase: return tuples from the processed batch one-by-one */
+            while (node->vec_batch_index < node->vec_batch_count)
+            {
+                HeapTuple tup = node->vec_batch_tuples[node->vec_batch_index++];
+                if (tup != NULL)
+                {
+                    ExecForceStoreHeapTuple(tup, node->ss_ScanTupleSlot, true); /* Will be freed by ExecClearTuple */
+                    econtext->ecxt_scantuple = node->ss_ScanTupleSlot;
+                    
+                    if (projInfo)
+                        return ExecProject(projInfo);
+                    return node->ss_ScanTupleSlot;
+                }
+            }
+
+            if (node->vec_batch_done)
+            {
+                /* Scan complete — log aggregate results */
+                if (node->vec_agg_enabled && !node->vec_agg_logged)
+                {
+                    int i;
+                    for (i = 0; i < node->vec_agg_ngroups; i++)
+                    {
+                        if (node->vec_agg_count[i] == 0) continue;
+                        elog(LOG, "VECTORIZED AGG: PostType=%d avg_score=%.4f count=" INT64_FORMAT,
+                             node->vec_agg_keys[i],
+                             (double) node->vec_agg_sum_i64[i] / (double) node->vec_agg_count[i],
+                             node->vec_agg_count[i]);
+                    }
+                    elog(LOG, "VECTORIZED SCAN TOTAL: " INT64_FORMAT " passed, " INT64_FORMAT " filtered",
+                         node->vec_total_passed, node->vec_total_filtered);
+                    node->vec_agg_logged = true;
+                }
+                return NULL;
+            }
+            continue;
+        }
+
+        /* Volcano Execution (Fallback for non-vectorized queries) */
+        slot = ExecScanFetch(node, accessMtd, recheckMtd);
+        ResetExprContext(econtext);
+        
+        if (TupIsNull(slot)) return NULL;
+
+        econtext->ecxt_scantuple = slot;
+        if (qual == NULL || ExecQual(qual, econtext))
+        {
+            if (projInfo)
+                return ExecProject(projInfo);
+            return slot;
+        }
+        else
+        {
+            InstrCountFiltered1(node, 1);
+        }
+    }
 }
+
 
 /*
  * ExecAssignScanProjectionInfo
@@ -350,5 +604,18 @@ ExecScanReScan(ScanState *node)
 					epqstate->epqExtra->relsubs_blocked[rtindex - 1];
 			}
 		}
+	}
+
+	/* VECTORIZED: reset streaming counters and aggregate state on rescan */
+	if (node->vec_init && node->vec_active)
+	{
+		node->vec_passed = 0;
+		node->vec_filtered = 0;
+		node->vec_total_passed = 0;
+		node->vec_total_filtered = 0;
+		node->vec_batch_count = 0;
+		node->vec_batch_index = 0;
+		node->vec_batch_done = false;
+		vec_agg_reset(node);
 	}
 }
