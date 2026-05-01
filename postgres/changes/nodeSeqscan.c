@@ -50,11 +50,6 @@ static TupleTableSlot *SeqNext(SeqScanState *node);
  *
  *		This is a workhorse for ExecSeqScan.
  *
- *		VECTORIZED: We track how many tuples have been fetched in the
- *		current batch window (VEC_BATCH_SIZE). Each time a full batch
- *		completes, we emit a debug log so that the batch boundaries are
- *		visible in pg_log. The vec_active flag is set in ExecInitSeqScan
- *		so that EXPLAIN ANALYZE labels this node "Vectorized Seq Scan".
  * ----------------------------------------------------------------
  */
 static TupleTableSlot *
@@ -90,27 +85,22 @@ SeqNext(SeqScanState *node)
 	 */
 	if (table_scan_getnextslot(scandesc, direction, slot))
 	{
-		/*
-		 * VECTORIZED: count this row toward the current batch window.
-		 * We track batch boundaries but only log the summary at scan end
-		 * (in ExecEndSeqScan) to avoid per-row elog overhead in the hot path.
-		 */
-		node->ss.vec_total_rows++;
-		node->ss.vec_passed++;
-
-		if (node->ss.vec_passed >= VEC_BATCH_SIZE)
+		if (node->ss.vec_active)
 		{
-			node->ss.vec_batch_count++;
-			node->ss.vec_passed = 0;
+			node->ss.vec_total_rows++;
+			node->ss.vec_passed++;
+
+			if (node->ss.vec_passed >= VEC_BATCH_SIZE)
+			{
+				node->ss.vec_batch_count++;
+				node->ss.vec_passed = 0;
+			}
 		}
 
 		return slot;
 	}
 
-	/*
-	 * VECTORIZED: flush any partial final batch on scan completion.
-	 */
-	if (node->ss.vec_passed > 0)
+	if (node->ss.vec_active && node->ss.vec_passed > 0)
 	{
 		node->ss.vec_batch_count++;
 		node->ss.vec_passed = 0;
@@ -179,12 +169,7 @@ ExecInitSeqScan(SeqScan *node, EState *estate, int eflags)
 	scanstate->ss.ps.state = estate;
 	scanstate->ss.ps.ExecProcNode = ExecSeqScan;
 
-	/*
-	 * VECTORIZED: initialize batch tracking state.
-	 *
-	 * ExecScan resolves the real relation metadata and sets vec_active when
-	 * PG_VECTORIZED=1 and the scan can safely use the vectorized path.
-	 */
+	/* Legacy ExecScan vectorization is disabled; CustomScan owns this demo. */
 	scanstate->ss.vec_init		= false;
 	scanstate->ss.vec_active		= false;
 	scanstate->ss.vec_passed		= 0;
@@ -220,28 +205,6 @@ ExecInitSeqScan(SeqScan *node, EState *estate, int eflags)
 	ExecInitScanTupleSlot(estate, &scanstate->ss,
 						  RelationGetDescr(scanstate->ss.ss_currentRelation),
 						  table_slot_callbacks(scanstate->ss.ss_currentRelation));
-
-	/*
-	 * VECTORIZED: initialize relation attribute mapping early enough for an
-	 * Agg node above this scan to decide whether its AVG/COUNT fast path is
-	 * eligible before it drains the scan.
-	 */
-	{
-		const char *pg_vec = getenv("PG_VECTORIZED");
-		Oid relid = RelationGetRelid(scanstate->ss.ss_currentRelation);
-
-		scanstate->ss.vec_att_posttype = get_attnum(relid, "posttypeid");
-		scanstate->ss.vec_att_score = get_attnum(relid, "score");
-		scanstate->ss.vec_att_viewcount = get_attnum(relid, "viewcount");
-		if (!AttributeNumberIsValid(scanstate->ss.vec_att_viewcount))
-			scanstate->ss.vec_att_viewcount = get_attnum(relid, "views");
-
-		scanstate->ss.vec_active =
-			pg_vec != NULL &&
-			strcmp(pg_vec, "1") == 0 &&
-			AttributeNumberIsValid(scanstate->ss.vec_att_posttype) &&
-			AttributeNumberIsValid(scanstate->ss.vec_att_score);
-	}
 
 	/*
 	 * Initialize result type and projection.

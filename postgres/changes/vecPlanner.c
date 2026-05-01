@@ -17,6 +17,7 @@
 #include "optimizer/cost.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
 
 #include <stdlib.h>
@@ -30,13 +31,12 @@ void VecUninstallPlannerHook(void);
 
 static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
 static bool vec_planner_hook_installed = false;
+static bool vectorized_scan_enabled = false;
 
 static bool
 VecPlannerEnabled(void)
 {
-	const char *pg_vec = getenv("PG_VECTORIZED");
-
-	return pg_vec != NULL && strcmp(pg_vec, "1") == 0;
+	return vectorized_scan_enabled;
 }
 
 static bool
@@ -110,8 +110,22 @@ VecSetRelPathlist(PlannerInfo *root, RelOptInfo *rel,
 void
 VecInstallPlannerHook(void)
 {
+	const char *pg_vec = getenv("PG_VECTORIZED");
+
 	if (vec_planner_hook_installed)
 		return;
+
+	vectorized_scan_enabled = pg_vec != NULL && strcmp(pg_vec, "1") == 0;
+	DefineCustomBoolVariable("vectorized_scan",
+							 "Enables the StackFast vectorized CustomScan path.",
+							 "When enabled, eligible base table scans receive a Vectorized Seq Scan CustomPath.",
+							 &vectorized_scan_enabled,
+							 vectorized_scan_enabled,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
 
 	VecRegisterCustomScan();
 

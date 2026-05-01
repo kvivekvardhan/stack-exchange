@@ -170,78 +170,6 @@ ExecScanFetch(ScanState *node,
  *			 "cursor" is positioned before the first qualifying tuple.
  * ----------------------------------------------------------------
  */
-/* VECTORIZED: lookup helpers for real table schemas, not hardcoded layouts. */
-static AttrNumber
-vec_get_attnum(Oid relid, const char *name)
-{
-    AttrNumber attno;
-
-    attno = get_attnum(relid, name);
-    if (AttributeNumberIsValid(attno))
-        return attno;
-
-    return InvalidAttrNumber;
-}
-
-static bool
-vec_att_is_int4(TupleDesc desc, AttrNumber attno)
-{
-    Form_pg_attribute attr;
-
-    if (desc == NULL || !AttributeNumberIsValid(attno) || attno > desc->natts)
-        return false;
-
-    attr = TupleDescAttr(desc, attno - 1);
-    if (attr->attisdropped)
-        return false;
-
-    return attr->atttypid == INT4OID;
-}
-
-static bool
-vec_resolve_relation_attrs(ScanState *node)
-{
-    Oid relid;
-    TupleDesc desc;
-
-    node->vec_target_oid = InvalidOid;
-    node->vec_att_posttype = InvalidAttrNumber;
-    node->vec_att_score = InvalidAttrNumber;
-    node->vec_att_viewcount = InvalidAttrNumber;
-
-    if (node->ss_currentRelation == NULL || node->ss_ScanTupleSlot == NULL)
-        return false;
-
-    desc = node->ss_ScanTupleSlot->tts_tupleDescriptor;
-    if (desc == NULL)
-        return false;
-
-    relid = RelationGetRelid(node->ss_currentRelation);
-    if (!OidIsValid(relid))
-        return false;
-
-    node->vec_target_oid = relid;
-    node->vec_att_posttype = vec_get_attnum(relid, "posttypeid");
-    node->vec_att_score = vec_get_attnum(relid, "score");
-    node->vec_att_viewcount = vec_get_attnum(relid, "viewcount");
-
-    if (!AttributeNumberIsValid(node->vec_att_viewcount))
-        node->vec_att_viewcount = vec_get_attnum(relid, "views");
-
-    if (AttributeNumberIsValid(node->vec_att_posttype) &&
-        !vec_att_is_int4(desc, node->vec_att_posttype))
-        node->vec_att_posttype = InvalidAttrNumber;
-    if (AttributeNumberIsValid(node->vec_att_score) &&
-        !vec_att_is_int4(desc, node->vec_att_score))
-        node->vec_att_score = InvalidAttrNumber;
-    if (AttributeNumberIsValid(node->vec_att_viewcount) &&
-        !vec_att_is_int4(desc, node->vec_att_viewcount))
-        node->vec_att_viewcount = InvalidAttrNumber;
-
-    return AttributeNumberIsValid(node->vec_att_posttype) &&
-           AttributeNumberIsValid(node->vec_att_score);
-}
-
 TupleTableSlot *
 ExecScan(ScanState *node,
          ExecScanAccessMtd accessMtd,
@@ -256,123 +184,24 @@ ExecScan(ScanState *node,
     projInfo = node->ps.ps_ProjInfo;
     econtext = node->ps.ps_ExprContext;
 
-    /* VECTORIZED: one-time init — cache activation decision and allocate state. */
+    /*
+     * Legacy vectorized ExecScan path is intentionally disabled.
+     *
+     * The demo now routes vectorized table reads through the CustomScan node
+     * in vecScan.c, so a normal SeqScan should retain PostgreSQL's standard
+     * volcano execution behavior.  The vec_* fields remain in ScanState for
+     * the CustomScan/Agg experiment, but ExecScan no longer activates its old
+     * private batch loop.
+     */
     if (!node->vec_init)
     {
-        const char *pg_vec = getenv("PG_VECTORIZED");
-        bool has_relation = vec_resolve_relation_attrs(node);
-
-        {
-            bool is_parallel = (node->ss_currentScanDesc != NULL &&
-                                node->ss_currentScanDesc->rs_parallel != NULL);
-            node->vec_active = (pg_vec != NULL &&
-                                strcmp(pg_vec, "1") == 0 &&
-                                has_relation &&
-                                !is_parallel);
-        }
+        node->vec_active = false;
         node->vec_init = true;
-
-        if (node->vec_active)
-        {
-            node->vec_passed = 0;
-            node->vec_filtered = 0;
-            node->vec_total_passed = 0;
-            node->vec_total_filtered = 0;
-            /* VECTORIZED: true batch slot flow initialization */
-            node->vec_batch_count = 0;
-            node->vec_batch_index = 0;
-            node->vec_batch_done = false;
-            node->vec_batch_tuples = (HeapTuple *) palloc(VEC_BATCH_SIZE * sizeof(HeapTuple));
-        }
     }
 
     for (;;)
     {
-        /* VECTORIZED: bypass volcano loop and use internal batch processor if active */
-        if (node->vec_active)
-        {
-            /* If current batch is exhausted, fetch and process a new batch */
-            if (node->vec_batch_index >= node->vec_batch_count && !node->vec_batch_done)
-            {
-                int i;
-                node->vec_batch_index = 0;
-                node->vec_batch_count = 0;
-
-                /* 1. Batch Fetch Phase */
-                for (i = 0; i < VEC_BATCH_SIZE; i++)
-                {
-                    TupleTableSlot *raw = ExecScanFetch(node, accessMtd, recheckMtd);
-                    if (TupIsNull(raw))
-                    {
-                        node->vec_batch_done = true;
-                        break;
-                    }
-                    /* Store tuple in our batch buffer */
-                    node->vec_batch_tuples[node->vec_batch_count++] = ExecCopySlotHeapTuple(raw);
-                }
-
-                /* 2. Vectorized Processing Phase */
-                for (i = 0; i < node->vec_batch_count; i++)
-                {
-                    HeapTuple tup = node->vec_batch_tuples[i];
-                    bool pass = true;
-
-                    ResetExprContext(econtext);
-
-                    /*
-                     * Preserve correctness for all quals by evaluating ExecQual on
-                     * the tuple we just batched.
-                     */
-                    if (pass && qual != NULL)
-                    {
-                        ExecForceStoreHeapTuple(tup, node->ss_ScanTupleSlot, false);
-                        econtext->ecxt_scantuple = node->ss_ScanTupleSlot;
-                        pass = ExecQual(qual, econtext);
-                        ExecClearTuple(node->ss_ScanTupleSlot);
-                    }
-
-                    if (!pass)
-                    {
-                        heap_freetuple(tup);
-                        node->vec_batch_tuples[i] = NULL;
-                        node->vec_filtered++;
-                        node->vec_total_filtered++;
-                        InstrCountFiltered1(node, 1);
-                        continue;
-                    }
-
-                    /* Passed filter/qual. */
-                    node->vec_passed++;
-                    node->vec_total_passed++;
-
-                }
-            }
-
-            /* 3. Yield Phase: return tuples from the processed batch one-by-one */
-            while (node->vec_batch_index < node->vec_batch_count)
-            {
-                HeapTuple tup = node->vec_batch_tuples[node->vec_batch_index++];
-                if (tup != NULL)
-                {
-                    ExecForceStoreHeapTuple(tup, node->ss_ScanTupleSlot, true); /* Will be freed by ExecClearTuple */
-                    econtext->ecxt_scantuple = node->ss_ScanTupleSlot;
-                    
-                    if (projInfo)
-                        return ExecProject(projInfo);
-                    return node->ss_ScanTupleSlot;
-                }
-            }
-
-            if (node->vec_batch_done)
-            {
-                elog(LOG, "VECTORIZED SCAN TOTAL: " INT64_FORMAT " passed, " INT64_FORMAT " filtered",
-                     node->vec_total_passed, node->vec_total_filtered);
-                return NULL;
-            }
-            continue;
-        }
-
-        /* Volcano Execution (Fallback for non-vectorized queries) */
+        /* Standard volcano execution. Vectorized scans use vecScan.c. */
         slot = ExecScanFetch(node, accessMtd, recheckMtd);
         ResetExprContext(econtext);
         
