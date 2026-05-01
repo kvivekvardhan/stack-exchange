@@ -1449,6 +1449,9 @@ typedef struct BitmapOrState
  * ----------------------------------------------------------------
  */
 
+/* VECTORIZED: shared scan batch size used by execScan.c and nodeSeqscan.c */
+#define VEC_BATCH_SIZE 1000
+
 /* ----------------
  *	 ScanState information
  *

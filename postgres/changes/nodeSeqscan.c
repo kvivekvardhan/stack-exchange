@@ -51,7 +51,7 @@ static TupleTableSlot *SeqNext(SeqScanState *node);
  *		This is a workhorse for ExecSeqScan.
  *
  *		VECTORIZED: We track how many tuples have been fetched in the
- *		current batch window (VECTOR_BATCH_SIZE). Each time a full batch
+ *		current batch window (VEC_BATCH_SIZE). Each time a full batch
  *		completes, we emit a debug log so that the batch boundaries are
  *		visible in pg_log. The vec_active flag is set in ExecInitSeqScan
  *		so that EXPLAIN ANALYZE labels this node "Vectorized Seq Scan".
@@ -98,7 +98,7 @@ SeqNext(SeqScanState *node)
 		node->ss.vec_total_rows++;
 		node->ss.vec_passed++;
 
-		if (node->ss.vec_passed >= VECTOR_BATCH_SIZE)
+		if (node->ss.vec_passed >= VEC_BATCH_SIZE)
 		{
 			node->ss.vec_batch_count++;
 			node->ss.vec_passed = 0;

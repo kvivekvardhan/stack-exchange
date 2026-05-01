@@ -170,7 +170,6 @@ ExecScanFetch(ScanState *node,
  *			 "cursor" is positioned before the first qualifying tuple.
  * ----------------------------------------------------------------
  */
-#define VEC_BATCH_SIZE      1000
 /* VECTORIZED: lookup helpers for real table schemas, not hardcoded layouts. */
 static AttrNumber
 vec_get_attnum(Oid relid, const char *name)
@@ -239,7 +238,8 @@ vec_resolve_relation_attrs(ScanState *node)
         !vec_att_is_int4(desc, node->vec_att_viewcount))
         node->vec_att_viewcount = InvalidAttrNumber;
 
-    return true;
+    return AttributeNumberIsValid(node->vec_att_posttype) &&
+           AttributeNumberIsValid(node->vec_att_score);
 }
 
 TupleTableSlot *

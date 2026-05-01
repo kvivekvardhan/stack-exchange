@@ -5,7 +5,7 @@
 #   bash postgres/scripts/setup_vectorized.sh
 # ============================================================
 
-set -e  # Exit immediately on error
+set -euo pipefail  # Exit immediately on errors, including failed pipelines
 
 PROJECT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 CHANGES_DIR="$PROJECT_DIR/postgres/changes"
@@ -44,8 +44,7 @@ echo ""
 # STEP 2 — Clone PostgreSQL 15 source
 # -------------------------------------------------------
 if [ -d "$PG_SRC_DIR" ]; then
-  echo "[2/8] PG source already exists at $PG_SRC_DIR — pulling latest..."
-  git -C "$PG_SRC_DIR" pull --ff-only
+  echo "[2/8] Using existing PG source at $PG_SRC_DIR"
 else
   echo "[2/8] Cloning PostgreSQL source (this may take a few minutes)..."
   mkdir -p "$(dirname "$PG_SRC_DIR")"
@@ -65,20 +64,67 @@ echo "      Copied tuptable.h"
 cp "$CHANGES_DIR/execnodes.h"   "$PG_SRC_DIR/src/include/nodes/execnodes.h"
 echo "      Copied execnodes.h"
 
+cp "$CHANGES_DIR/execScan.c"    "$PG_SRC_DIR/src/backend/executor/execScan.c"
+echo "      Copied execScan.c"
+
 cp "$CHANGES_DIR/nodeSeqscan.c" "$PG_SRC_DIR/src/backend/executor/nodeSeqscan.c"
 echo "      Copied nodeSeqscan.c"
+
+cp "$CHANGES_DIR/nodeAgg.c"     "$PG_SRC_DIR/src/backend/executor/nodeAgg.c"
+echo "      Copied nodeAgg.c"
 
 cp "$CHANGES_DIR/explain.c"     "$PG_SRC_DIR/src/backend/commands/explain.c"
 echo "      Copied explain.c"
 
-# Apply nodeAgg patch (best-effort — may already be applied)
-cd "$PG_SRC_DIR"
-if git apply --check "$CHANGES_DIR/nodeAgg.c.patch" 2>/dev/null; then
-  git apply "$CHANGES_DIR/nodeAgg.c.patch"
-  echo "      Applied nodeAgg.c.patch"
+cp "$CHANGES_DIR/vecScan.c"     "$PG_SRC_DIR/src/backend/executor/vecScan.c"
+echo "      Copied vecScan.c"
+
+cp "$CHANGES_DIR/vecPlanner.c"  "$PG_SRC_DIR/src/backend/executor/vecPlanner.c"
+echo "      Copied vecPlanner.c"
+
+EXECUTOR_MAKEFILE="$PG_SRC_DIR/src/backend/executor/Makefile"
+wire_executor_obj() {
+  local obj="$1"
+
+  if ! grep -q "$obj" "$EXECUTOR_MAKEFILE"; then
+    sed -i "/nodeCustom\\.o/a\\	$obj \\\\" "$EXECUTOR_MAKEFILE"
+    if grep -q "$obj" "$EXECUTOR_MAKEFILE"; then
+      echo "      Wired $obj into executor Makefile"
+    else
+      echo "      ERROR: could not find nodeCustom.o anchor in executor Makefile"
+      exit 1
+    fi
+  else
+    echo "      Makefile has $obj"
+  fi
+}
+
+wire_executor_obj "vecScan.o"
+wire_executor_obj "vecPlanner.o"
+
+POSTGRES_C="$PG_SRC_DIR/src/backend/tcop/postgres.c"
+
+if ! grep -q "extern void VecInstallPlannerHook(void);" "$POSTGRES_C"; then
+  sed -i '/int[[:space:]]*log_statement = LOGSTMT_NONE;/a\\nextern void VecInstallPlannerHook(void);' "$POSTGRES_C"
+  echo "      Added VecInstallPlannerHook declaration to postgres.c"
 else
-  echo "      nodeAgg.c.patch already applied or not applicable — skipping."
+  echo "      postgres.c has VecInstallPlannerHook declaration"
 fi
+
+if ! grep -q "VecInstallPlannerHook();" "$POSTGRES_C"; then
+  sed -i '/BaseInit();/a\\n\t/* VECTORIZED: install experimental CustomScan planner hook for this backend. */\n\tVecInstallPlannerHook();' "$POSTGRES_C"
+  echo "      Added VecInstallPlannerHook call to postgres.c"
+else
+  echo "      postgres.c has VecInstallPlannerHook call"
+fi
+
+rm -f "$PG_SRC_DIR/src/backend/executor/vecScan.o" \
+      "$PG_SRC_DIR/src/backend/executor/vecPlanner.o" \
+      "$PG_SRC_DIR/src/backend/executor/execScan.o" \
+      "$PG_SRC_DIR/src/backend/executor/nodeAgg.o"
+echo "      Cleared vector executor objects for rebuild"
+
+cd "$PG_SRC_DIR"
 echo ""
 
 # -------------------------------------------------------
@@ -118,19 +164,21 @@ if [ -d "$PG_DATA" ]; then
   "$PG_INSTALL/bin/pg_ctl" -D "$PG_DATA" stop 2>/dev/null || true
   sleep 2
 else
-  "$PG_INSTALL/bin/initdb" -D "$PG_DATA" -U madhav
+  "$PG_INSTALL/bin/initdb" -D "$PG_DATA" -U vivekvardhank
   echo "      initdb complete."
 fi
 
-# Start the vectorized instance on port 5433
-"$PG_INSTALL/bin/pg_ctl" -D "$PG_DATA" -l "$PG_DATA/logfile" -o "-p 5433" start
+# Start the vectorized instance on port 5433.  The planner hook checks this
+# environment variable inside the server backend, so it must be set when the
+# postmaster starts, not only when psql starts.
+PG_VECTORIZED=1 "$PG_INSTALL/bin/pg_ctl" -D "$PG_DATA" -l "$PG_DATA/logfile" -o "-p 5433" start
 sleep 2
 
 # Create the 'stackfast' database if it doesn't exist
-"$PG_INSTALL/bin/psql" -p 5433 -U madhav -d postgres -tc \
+"$PG_INSTALL/bin/psql" -p 5433 -U vivekvardhank -d postgres -tc \
   "SELECT 1 FROM pg_database WHERE datname='stackfast'" \
   | grep -q 1 || \
-  "$PG_INSTALL/bin/psql" -p 5433 -U madhav -d postgres -c "CREATE DATABASE stackfast;"
+  "$PG_INSTALL/bin/psql" -p 5433 -U vivekvardhank -d postgres -c "CREATE DATABASE stackfast;"
 
 echo "      Done."
 echo ""
@@ -139,9 +187,9 @@ echo ""
 # STEP 8 — Verify
 # -------------------------------------------------------
 echo "[8/8] Verifying vectorized engine..."
-EXPLAIN_OUT=$("$PG_INSTALL/bin/psql" -p 5433 -U madhav -d stackfast -c \
+EXPLAIN_OUT=$("$PG_INSTALL/bin/psql" -p 5433 -U vivekvardhank -d stackfast -c \
   "EXPLAIN SELECT * FROM posts LIMIT 1;" 2>&1 || \
-  "$PG_INSTALL/bin/psql" -p 5433 -U madhav -d postgres -c \
+  "$PG_INSTALL/bin/psql" -p 5433 -U vivekvardhank -d postgres -c \
   "EXPLAIN SELECT 1;")
 echo "$EXPLAIN_OUT"
 

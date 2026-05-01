@@ -530,6 +530,50 @@ ExecVecAggMatchesAggrefs(AggState *aggstate, ScanState *scan)
 	return seen_avg && seen_count;
 }
 
+static ScanState *
+ExecVecAggOuterScan(PlanState *outer)
+{
+	CustomScanState *custom;
+
+	if (outer == NULL)
+		return NULL;
+	if (IsA(outer, ScanState))
+		return (ScanState *) outer;
+	if (IsA(outer, CustomScanState))
+	{
+		custom = (CustomScanState *) outer;
+		return &custom->ss;
+	}
+	return NULL;
+}
+
+static bool
+ExecVecAggScanReady(ScanState *scan)
+{
+	return scan != NULL && scan->vec_active;
+}
+
+static bool
+ExecVecAggReady(AggState *aggstate, ScanState **scan_out)
+{
+	PlanState  *outer;
+	ScanState  *scan;
+
+	if (scan_out != NULL)
+		*scan_out = NULL;
+	if (aggstate == NULL || !aggstate->vec_agg_enabled)
+		return false;
+
+	outer = outerPlanState(aggstate);
+	scan = ExecVecAggOuterScan(outer);
+	if (!ExecVecAggScanReady(scan))
+		return false;
+
+	if (scan_out != NULL)
+		*scan_out = scan;
+	return true;
+}
+
 static TupleTableSlot *
 ExecVecAgg(AggState *aggstate)
 {
@@ -543,17 +587,15 @@ ExecVecAgg(AggState *aggstate)
 	int		   g;
 	int		   grp_attno;
 
-	outer = outerPlanState(aggstate);
-	if (outer == NULL || !IsA(outer, ScanState))
+	if (!ExecVecAggReady(aggstate, &scan))
 		return NULL;
 
+	outer = outerPlanState(aggstate);
 	aggnode = castNode(Agg, aggstate->ss.ps.plan);
-	scan = (ScanState *) outer;
 	econtext = aggstate->ss.ps.ps_ExprContext;
 	projInfo = aggstate->ss.ps.ps_ProjInfo;
 
-	if (!scan->vec_active ||
-		aggstate->vec_agg_keys == NULL ||
+	if (aggstate->vec_agg_keys == NULL ||
 		aggstate->vec_agg_sum_i64 == NULL ||
 		aggstate->vec_agg_count == NULL ||
 		aggstate->aggsplit != AGGSPLIT_SIMPLE ||
@@ -2425,48 +2467,8 @@ ExecAgg(PlanState *pstate)
 	AggState   *node = castNode(AggState, pstate);
 	TupleTableSlot *result = NULL;
 
-	/* VECTORIZED: detect scan-side aggregate passthrough mode once. */
-	if (!node->vec_agg_enabled)
-	{
-		PlanState *outer = outerPlanState(node);
-		Agg *aggnode = castNode(Agg, node->ss.ps.plan);
-		if (outer && IsA(outer, ScanState))
-		{
-			ScanState *scan = (ScanState *) outer;
-			node->vec_agg_enabled =
-				scan->vec_active &&
-				AttributeNumberIsValid(scan->vec_att_posttype) &&
-				AttributeNumberIsValid(scan->vec_att_score) &&
-				node->aggsplit == AGGSPLIT_SIMPLE &&
-				(node->aggstrategy == AGG_PLAIN ||
-				 node->aggstrategy == AGG_SORTED) &&
-				aggnode != NULL &&
-				aggnode->numCols == 1 &&
-				aggnode->grpColIdx != NULL &&
-				aggnode->grpColIdx[0] > 0 &&
-				aggnode->groupingSets == NIL &&
-				node->numaggs == 2 &&
-				node->ss.ps.qual == NULL &&
-				ExecVecAggMatchesAggrefs(node, scan);
-			node->vec_agg_drained = false;
-			node->vec_agg_emit_index = 0;
-			node->vec_agg_ngroups = 0;
-			node->vec_agg_cap = 0;
-			node->vec_agg_keys = NULL;
-			node->vec_agg_sum_i64 = NULL;
-			node->vec_agg_count = NULL;
-
-			if (node->vec_agg_enabled)
-			{
-				node->vec_agg_keys = (int32 *) palloc(VEC_AGG_INIT_CAP * sizeof(int32));
-				node->vec_agg_sum_i64 = (int64 *) palloc0(VEC_AGG_INIT_CAP * sizeof(int64));
-				node->vec_agg_count = (int64 *) palloc0(VEC_AGG_INIT_CAP * sizeof(int64));
-				node->vec_agg_cap = VEC_AGG_INIT_CAP;
-			}
-		}
-	}
-	if (node->vec_agg_enabled)
-		return ExecVecAgg(node);
+	/* VEC AGG DISABLED PENDING FIX */
+	/* if (ExecVecAggReady(node, NULL)) return ExecVecAgg(node); */
 
 	CHECK_FOR_INTERRUPTS();
 
