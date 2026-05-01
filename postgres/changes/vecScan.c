@@ -20,6 +20,7 @@
 #include "optimizer/cost.h"
 #include "optimizer/plancat.h"
 #include "optimizer/restrictinfo.h"
+#include "utils/datum.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
@@ -29,7 +30,9 @@ typedef struct VecScanState
 	TableScanDesc scandesc;
 	TupleTableSlot *scan_slot;
 	TupleTableSlot *result_slot;
-	HeapTuple  *batch_tuples;
+	int			natts;			/* number of attributes in the relation */
+	Datum	   *batch_values;	/* flat array [VEC_BATCH_SIZE * natts] */
+	bool	   *batch_nulls;	/* flat array [VEC_BATCH_SIZE * natts] */
 	int			batch_count;
 	int			batch_index;
 	bool		batch_done;
@@ -124,37 +127,34 @@ static void
 VecBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 {
 	VecScanState *vstate = (VecScanState *) node;
+	Oid			relid = RelationGetRelid(node->ss.ss_currentRelation);
+	TupleDesc	tdesc = RelationGetDescr(node->ss.ss_currentRelation);
+	int			natts = tdesc->natts;
 
 	vstate->scandesc = NULL;
-	vstate->scan_slot = ExecInitExtraTupleSlot(estate,
-											  RelationGetDescr(node->ss.ss_currentRelation),
+	vstate->natts = natts;
+	vstate->scan_slot = ExecInitExtraTupleSlot(estate, tdesc,
 											  table_slot_callbacks(node->ss.ss_currentRelation));
-	vstate->result_slot = MakeSingleTupleTableSlot(RelationGetDescr(node->ss.ss_currentRelation),
-												  &TTSOpsHeapTuple);
-	vstate->batch_tuples = (HeapTuple *) palloc0(VEC_BATCH_SIZE * sizeof(HeapTuple));
+	vstate->result_slot = MakeSingleTupleTableSlot(tdesc, &TTSOpsVirtual);
+	vstate->batch_values = (Datum *) palloc(VEC_BATCH_SIZE * natts * sizeof(Datum));
+	vstate->batch_nulls = (bool *) palloc(VEC_BATCH_SIZE * natts * sizeof(bool));
 	vstate->batch_count = 0;
 	vstate->batch_index = 0;
 	vstate->batch_done = false;
 	vstate->total_passed = 0;
 	vstate->total_filtered = 0;
+
+	/* Activate the vec-agg gate: let the agg layer detect this scan. */
+	node->ss.vec_active = true;
+	node->ss.vec_att_posttype = get_attnum(relid, "posttypeid");
+	node->ss.vec_att_score = get_attnum(relid, "score");
 }
 
 static void
 VecClearBatch(VecScanState *vstate)
 {
-	int			i;
-
 	if (vstate->result_slot != NULL)
 		ExecClearTuple(vstate->result_slot);
-
-	for (i = 0; i < vstate->batch_count; i++)
-	{
-		if (vstate->batch_tuples[i] != NULL)
-		{
-			heap_freetuple(vstate->batch_tuples[i]);
-			vstate->batch_tuples[i] = NULL;
-		}
-	}
 
 	vstate->batch_count = 0;
 	vstate->batch_index = 0;
@@ -218,7 +218,32 @@ VecFillBatch(VecScanState *vstate)
 			continue;
 		}
 
-		vstate->batch_tuples[vstate->batch_count++] = ExecCopySlotHeapTuple(slot);
+		{
+			int			base = vstate->batch_count * vstate->natts;
+			int			a;
+			TupleDesc	tdesc = expr_slot->tts_tupleDescriptor;
+
+			for (a = 0; a < vstate->natts; a++)
+			{
+				if (expr_slot->tts_isnull[a])
+				{
+					vstate->batch_values[base + a] = (Datum) 0;
+					vstate->batch_nulls[base + a] = true;
+				}
+				else
+				{
+					Form_pg_attribute att = TupleDescAttr(tdesc, a);
+
+					if (att->attbyval)
+						vstate->batch_values[base + a] = expr_slot->tts_values[a];
+					else
+						vstate->batch_values[base + a] =
+							datumCopy(expr_slot->tts_values[a], false, att->attlen);
+					vstate->batch_nulls[base + a] = false;
+				}
+			}
+			vstate->batch_count++;
+		}
 		vstate->total_passed++;
 		ExecClearTuple(slot);
 	}
@@ -238,13 +263,17 @@ VecExecCustomScan(CustomScanState *node)
 
 		while (vstate->batch_index < vstate->batch_count)
 		{
-			HeapTuple	tup = vstate->batch_tuples[vstate->batch_index++];
+			int			idx = vstate->batch_index++;
+			int			base = idx * vstate->natts;
 
-			if (tup == NULL)
-				continue;
-
-			ExecForceStoreHeapTuple(tup, vstate->result_slot, false);
-			slot_getallattrs(vstate->result_slot);
+			ExecClearTuple(vstate->result_slot);
+			memcpy(vstate->result_slot->tts_values,
+				   &vstate->batch_values[base],
+				   vstate->natts * sizeof(Datum));
+			memcpy(vstate->result_slot->tts_isnull,
+				   &vstate->batch_nulls[base],
+				   vstate->natts * sizeof(bool));
+			ExecStoreVirtualTuple(vstate->result_slot);
 			econtext->ecxt_scantuple = vstate->result_slot;
 
 			if (projInfo != NULL)

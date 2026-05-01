@@ -31,7 +31,7 @@ void VecUninstallPlannerHook(void);
 
 static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
 static bool vec_planner_hook_installed = false;
-static bool vectorized_scan_enabled = false;
+static bool vectorized_scan_enabled = true;
 
 static bool
 VecPlannerEnabled(void)
@@ -115,7 +115,9 @@ VecInstallPlannerHook(void)
 	if (vec_planner_hook_installed)
 		return;
 
-	vectorized_scan_enabled = pg_vec != NULL && strcmp(pg_vec, "1") == 0;
+	/* Default on; only suppress if PG_VECTORIZED is explicitly "0". */
+	if (pg_vec != NULL)
+		vectorized_scan_enabled = strcmp(pg_vec, "0") != 0;
 	DefineCustomBoolVariable("vectorized_scan",
 							 "Enables the StackFast vectorized CustomScan path.",
 							 "When enabled, eligible base table scans receive a Vectorized Seq Scan CustomPath.",
