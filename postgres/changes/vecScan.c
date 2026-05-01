@@ -24,21 +24,7 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
-typedef struct VecScanState
-{
-	CustomScanState css;
-	TableScanDesc scandesc;
-	TupleTableSlot *scan_slot;
-	TupleTableSlot *result_slot;
-	int			natts;			/* number of attributes in the relation */
-	Datum	   *batch_values;	/* flat array [VEC_BATCH_SIZE * natts] */
-	bool	   *batch_nulls;	/* flat array [VEC_BATCH_SIZE * natts] */
-	int			batch_count;
-	int			batch_index;
-	bool		batch_done;
-	int64		total_passed;
-	int64		total_filtered;
-} VecScanState;
+#include "vecScan.h"
 
 static void VecBeginCustomScan(CustomScanState *node, EState *estate, int eflags);
 static TupleTableSlot *VecExecCustomScan(CustomScanState *node);
@@ -174,7 +160,7 @@ VecStoreVirtualScanTuple(TupleTableSlot *src, TupleTableSlot *dst)
 	return dst;
 }
 
-static void
+void
 VecFillBatch(VecScanState *vstate)
 {
 	CustomScanState *node = &vstate->css;

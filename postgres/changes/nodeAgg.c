@@ -250,6 +250,7 @@
 
 #include "access/htup_details.h"
 #include "executor/nodeSeqscan.h"
+#include "vecScan.h"
 #include "access/parallel.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_aggregate.h"
@@ -381,7 +382,7 @@ ExecVecAggReset(AggState *aggstate)
 static bool
 ExecVecAggStrategySupported(AggStrategy strategy)
 {
-	return strategy == AGG_PLAIN || strategy == AGG_SORTED;
+	return strategy == AGG_PLAIN || strategy == AGG_SORTED || strategy == AGG_HASHED;
 }
 
 static int
@@ -679,15 +680,68 @@ ExecVecAgg(AggState *aggstate)
 
 	if (!aggstate->vec_agg_drained)
 	{
-		TupleTableSlot *s;
+		VecScanState *vss = NULL;
 
 		ExecVecAggReset(aggstate);
-		while ((s = ExecProcNode(outer)) != NULL && !TupIsNull(s))
+
+		if (scan->vec_active && IsA(outer, CustomScanState))
+			vss = (VecScanState *) outer;
+
+		if (vss != NULL)
 		{
-			if (!ExecVecAggAccumulateSlot(aggstate, s, grp_attno, score_attno))
-				return NULL;
-			CHECK_FOR_INTERRUPTS();
+			/*
+			 * Direct batch loop: read batch_values[] without going through
+			 * ExecProcNode for each row, eliminating per-tuple call overhead.
+			 */
+			while (!vss->batch_done)
+			{
+				int		i;
+
+				CHECK_FOR_INTERRUPTS();
+				VecFillBatch(vss);
+
+				for (i = 0; i < vss->batch_count; i++)
+				{
+					int		base = i * vss->natts;
+					bool	grp_null;
+					int32	grp_key;
+					bool	score_null;
+					int		g;
+
+					if (AttributeNumberIsValid(grp_attno))
+					{
+						grp_null = vss->batch_nulls[base + grp_attno - 1];
+						if (grp_null)
+							continue;
+						grp_key = DatumGetInt32(vss->batch_values[base + grp_attno - 1]);
+					}
+					else
+						grp_key = 0;
+
+					score_null = vss->batch_nulls[base + score_attno - 1];
+					g = ExecVecAggFindOrAddGroup(aggstate, grp_key);
+					if (!score_null)
+					{
+						aggstate->vec_agg_sum_i64[g] +=
+							(int64) DatumGetInt32(vss->batch_values[base + score_attno - 1]);
+						aggstate->vec_agg_score_count[g]++;
+					}
+					aggstate->vec_agg_count[g]++;
+				}
+			}
 		}
+		else
+		{
+			TupleTableSlot *s;
+
+			while ((s = ExecProcNode(outer)) != NULL && !TupIsNull(s))
+			{
+				if (!ExecVecAggAccumulateSlot(aggstate, s, grp_attno, score_attno))
+					return NULL;
+				CHECK_FOR_INTERRUPTS();
+			}
+		}
+
 		aggstate->vec_agg_drained = true;
 		aggstate->vec_agg_emit_index = 0;
 	}
