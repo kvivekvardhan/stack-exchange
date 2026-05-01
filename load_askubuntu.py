@@ -2,8 +2,6 @@ import xml.etree.ElementTree as ET
 import psycopg2
 
 def connect(port):
-    if port == 5434:
-        return psycopg2.connect(host='127.0.0.1', port=5432, database='stackfast', user='postgres')
     return psycopg2.connect(host='127.0.0.1', port=port, database='stackfast', user='kishan')
 
 def load(port):
@@ -103,6 +101,8 @@ def load(port):
     conn.close()
     print(f"Port {port} complete!")
 
-load(5433)
-load(5434)
+import sys
+ports = [int(p) for p in sys.argv[1:]] or [5433, 5434]
+for p in ports:
+    load(p)
 print("\nAll done!")

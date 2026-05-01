@@ -573,6 +573,14 @@ ExecVecAggMaybeEnable(AggState *aggstate)
 	Agg		   *aggnode;
 	ScanState  *scan;
 
+	/*
+	 * VECTORIZED: hijack disabled on kishans_branch — the gate below was
+	 * firing on plain `count(*)` and clobbering all aggregate output. Path B
+	 * (proper diagnosis + repair) will revisit. Returning false sends every
+	 * Agg through PostgreSQL's standard executor.
+	 */
+	return false;
+
 	if (aggstate == NULL)
 		return false;
 	if (aggstate->vec_agg_enabled)

@@ -53,3 +53,43 @@ psql -p 5433 -d stackfast -c "\timing on" -c "SELECT posttypeid, AVG(score), COU
 psql -h 127.0.0.1 -p 5432 -U postgres -d stackfast -c "\timing on" -c "SELECT posttypeid, AVG(score), COUNT(*) FROM posts WHERE viewcount > 100 GROUP BY posttypeid;"
 
 cd ~/Desktop/dbis_project && ./duckdb taxi.db -c "\timing on" -c "SELECT passenger_count, AVG(fare_amount), COUNT(*) FROM taxi_trips WHERE trip_distance > 5 GROUP BY passenger_count;"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  -c "SELECT COUNT(*) FROM posts WHERE viewcount > 100;" \
+  -c "SELECT AVG(score) FROM posts WHERE score > 10;" \
+  -c "SELECT posttypeid, AVG(score) FROM posts WHERE viewcount > 100 GROUP BY posttypeid;" \
+
+
+
+
+
+
+
+
+
+echo "=== Vanilla / Baseline PostgreSQL :5434 ==="
+psql "postgresql://kishan@localhost:5434/stackfast" \
+  -c "\timing on" \
+  -c "EXPLAIN ANALYZE SELECT AVG(score) FROM posts WHERE score > 10;"
+
+echo "=== Vectorized PostgreSQL :5433 ==="
+psql "postgresql://kishan@localhost:5433/stackfast" \
+  -c "\timing on" \
+  -c "SELECT COUNT(*) FROM posts WHERE viewcount > 100;" \
+  -c "SELECT AVG(score) FROM posts WHERE score > 10;" \
+  -c "SELECT posttypeid, AVG(score) FROM posts WHERE viewcount > 100 GROUP BY posttypeid;" \
+  -c "EXPLAIN SELECT AVG(score) FROM posts WHERE score > 10;"
