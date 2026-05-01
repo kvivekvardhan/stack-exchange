@@ -18,6 +18,7 @@
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
 #include "optimizer/cost.h"
+#include "optimizer/plancat.h"
 #include "optimizer/restrictinfo.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -112,7 +113,7 @@ VecPlanCustomPath(PlannerInfo *root, RelOptInfo *rel,
 	cscan->custom_plans = custom_plans;
 	cscan->custom_exprs = NIL;
 	cscan->custom_private = best_path->custom_private;
-	cscan->custom_scan_tlist = NIL;
+	cscan->custom_scan_tlist = build_physical_tlist(root, rel);
 	cscan->custom_relids = bms_make_singleton(rel->relid);
 	cscan->methods = &VecCustomScanMethods;
 
@@ -123,8 +124,6 @@ static void
 VecBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 {
 	VecScanState *vstate = (VecScanState *) node;
-	ScanState  *scan = &node->ss;
-	Oid			relid = RelationGetRelid(scan->ss_currentRelation);
 
 	vstate->scandesc = NULL;
 	vstate->scan_slot = ExecInitExtraTupleSlot(estate,
@@ -138,20 +137,6 @@ VecBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 	vstate->batch_done = false;
 	vstate->total_passed = 0;
 	vstate->total_filtered = 0;
-
-	/*
-	 * Preserve the current nodeAgg fast-path contract while aggregate pushdown
-	 * is being moved onto planner hooks.  The planner only creates this node
-	 * for relations with int4 posttypeid/score columns.
-	 */
-	scan->vec_init = true;
-	scan->vec_active = true;
-	scan->vec_target_oid = relid;
-	scan->vec_att_posttype = get_attnum(relid, "posttypeid");
-	scan->vec_att_score = get_attnum(relid, "score");
-	scan->vec_att_viewcount = get_attnum(relid, "viewcount");
-	if (!AttributeNumberIsValid(scan->vec_att_viewcount))
-		scan->vec_att_viewcount = get_attnum(relid, "views");
 }
 
 static void
@@ -259,16 +244,16 @@ VecExecCustomScan(CustomScanState *node)
 				continue;
 
 			ExecForceStoreHeapTuple(tup, vstate->result_slot, false);
-			VecStoreVirtualScanTuple(vstate->result_slot, node->ss.ss_ScanTupleSlot);
-			econtext->ecxt_scantuple = node->ss.ss_ScanTupleSlot;
+			slot_getallattrs(vstate->result_slot);
+			econtext->ecxt_scantuple = vstate->result_slot;
 
 			if (projInfo != NULL)
 			{
-				projInfo->pi_exprContext->ecxt_scantuple = node->ss.ss_ScanTupleSlot;
+				projInfo->pi_exprContext->ecxt_scantuple = vstate->result_slot;
 				return ExecProject(projInfo);
 			}
 
-			return node->ss.ss_ScanTupleSlot;
+			return vstate->result_slot;
 		}
 
 		if (vstate->batch_done)
