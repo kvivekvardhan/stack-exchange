@@ -548,16 +548,22 @@ ExecVecAggAvgInputAttno(AggState *aggstate)
 static ScanState *
 ExecVecAggOuterScan(PlanState *outer)
 {
-	CustomScanState *custom;
+	PlanState  *node = outer;
 
-	if (outer == NULL)
-		return NULL;
-	if (IsA(outer, ScanState))
-		return (ScanState *) outer;
-	if (IsA(outer, CustomScanState))
+	while (node != NULL)
 	{
-		custom = (CustomScanState *) outer;
-		return &custom->ss;
+		if (IsA(node, CustomScanState))
+			return &((CustomScanState *) node)->ss;
+		if (IsA(node, ScanState))
+			return (ScanState *) node;
+
+		/* Walk through single-child passthrough nodes (Sort, Material) */
+		if (IsA(node, SortState) || IsA(node, MaterialState))
+		{
+			node = node->lefttree;
+			continue;
+		}
+		break;
 	}
 	return NULL;
 }
@@ -684,8 +690,8 @@ ExecVecAgg(AggState *aggstate)
 
 		ExecVecAggReset(aggstate);
 
-		if (scan->vec_active && IsA(outer, CustomScanState))
-			vss = (VecScanState *) outer;
+		if (scan->vec_active)
+			vss = (VecScanState *) scan;	/* ScanState is first field of VecScanState */
 
 		if (vss != NULL)
 		{
