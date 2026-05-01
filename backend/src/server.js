@@ -180,11 +180,8 @@ function mapSearchQuestion(row) {
 
 async function runQuery(engine, sql, params = [], options = {}) {
   return withTransactionEngine(engine, async (client) => {
-    // For the vectorized engine, disable parallel workers so the query always
-    // uses the single-process Vectorized Seq Scan path (not Parallel Seq Scan
-    // which bypasses our custom batch execution).
-    if (engine === "vectorized") {
-      await client.query("SET LOCAL max_parallel_workers_per_gather = 0");
+    if (options.disableHashAgg) {
+      await client.query("SET LOCAL enable_hashagg = off");
     }
 
     const start = process.hrtime.bigint();
@@ -193,9 +190,6 @@ async function runQuery(engine, sql, params = [], options = {}) {
 
     let plan = null;
     if (options.inspect) {
-      if (engine === "vectorized") {
-        await client.query("SET LOCAL max_parallel_workers_per_gather = 0");
-      }
       const explainResult = await client.query(
         `EXPLAIN (FORMAT TEXT) ${sql}`,
         params
@@ -935,21 +929,26 @@ app.get(
         params: [tagFilter]
       },
       {
-        name: "tag_aggregate",
+        name: "posttype_score_aggregate",
         sql: `
-          SELECT t.tagname AS tag_name, t.count
-          FROM tags t
-          ORDER BY t.count DESC
+          SELECT p.posttypeid, AVG(p.score) AS avg_score, COUNT(*) AS post_count
+          FROM posts p
+          GROUP BY p.posttypeid
+          ORDER BY p.posttypeid
           LIMIT 10
         `,
-        params: []
+        params: [],
+        disableHashAgg: true
       }
     ];
 
     async function runBenchmark(engine) {
       const results = [];
       for (const item of queries) {
-        const outcome = await runQuery(engine, item.sql, item.params, { inspect });
+        const outcome = await runQuery(engine, item.sql, item.params, {
+          inspect,
+          disableHashAgg: item.disableHashAgg
+        });
         results.push({
           name: item.name,
           timingMs: outcome.timingMs,
@@ -1006,11 +1005,9 @@ app.post(
         await client.query("SET TRANSACTION READ ONLY");
         // Use a generous timeout for EXPLAIN ANALYZE on large tables
         await client.query("SET LOCAL statement_timeout = 60000");
-        // Disable parallel workers so we see clean single-process plans
-        // and the Vectorized Seq Scan path is always taken (not Parallel Seq Scan)
-        await client.query("SET LOCAL max_parallel_workers_per_gather = 0");
         await client.query("SET LOCAL enable_indexscan = off");
         await client.query("SET LOCAL enable_bitmapscan = off");
+        await client.query("SET LOCAL enable_hashagg = off");
 
         const start = process.hrtime.bigint();
         let result, error = null;

@@ -1,8 +1,8 @@
 -- StackFast canonical schema (Stack Overflow style).
 -- This is the new vectorized target — Posts replaces se_posts.
 -- Apply to BOTH the baseline (5434) and vectorized (5433) databases:
---   psql -h 127.0.0.1 -p 5434 -d stackfast -f init_schema.sql
---   psql -h 127.0.0.1 -p 5433 -d stackfast -f init_schema.sql
+--   psql -h 127.0.0.1 -p 5434 -d stackfast -f /path/to/init_schema.sql
+--   psql -h 127.0.0.1 -p 5433 -d stackfast -f /path/to/init_schema.sql
 
 DROP TABLE IF EXISTS PostHistory CASCADE;
 DROP TABLE IF EXISTS PostLinks   CASCADE;

@@ -64,29 +64,38 @@ fi
 # ─────────────────────────────────────────────
 step "Checking Baseline PostgreSQL (port 5434)..."
 
+# Kill any ghost processes secretly holding port 5434
+PID_5434=$(lsof -ti tcp:5434 2>/dev/null)
+if [ -n "$PID_5434" ]; then
+  warn "Port 5434 in use by PID $PID_5434 — stopping it..."
+  kill -9 "$PID_5434" 2>/dev/null
+  sleep 2
+fi
+
 if pg_isready -h 127.0.0.1 -p 5434 -q 2>/dev/null; then
   ok "Baseline PG already running on port 5434"
 else
   warn "Baseline PG not running — starting it..."
-  # Try to find a running cluster config
-  PG17_DATA=$(ls -d /var/lib/postgresql/*/main 2>/dev/null | head -1)
-  if [ -n "$PG17_DATA" ]; then
-    sudo pg_ctlcluster $(ls /etc/postgresql/ | head -1) main start 2>/dev/null || true
-  fi
-  # Fallback: try the manually-launched approach
-  if ! pg_isready -h 127.0.0.1 -p 5434 -q 2>/dev/null; then
-    PG17_BIN=$(ls /usr/lib/postgresql/*/bin/postgres 2>/dev/null | head -1 | xargs dirname)
-    PG17_DATA=$(ls -d /var/lib/postgresql/*/main 2>/dev/null | head -1)
-    if [ -n "$PG17_BIN" ] && [ -n "$PG17_DATA" ]; then
-      "$PG17_BIN/pg_ctl" -D "$PG17_DATA" -l "$LOG_DIR/pg17_baseline.log" \
-        -o "-p 5434 -h 127.0.0.1 -k /tmp" start 2>&1 | tail -1
+  
+  # Try the main system wrapper to start the baseline cluster safely
+  PG17_VERSION=$(ls /etc/postgresql/ | head -1)
+  if [ -n "$PG17_VERSION" ]; then
+    sudo pg_ctlcluster $PG17_VERSION baseline start
+    START_STATUS=$?
+    if [ $START_STATUS -ne 0 ]; then
+       err "pg_ctlcluster failed to start 17 baseline!"
+       err "Run 'cat /var/log/postgresql/postgresql-$PG17_VERSION-baseline.log' to see why."
     fi
+  else
+    err "Could not find a PostgreSQL configuration in /etc/postgresql/"
   fi
+
   sleep 2
   if pg_isready -h 127.0.0.1 -p 5434 -q 2>/dev/null; then
-    ok "Baseline PG started on port 5434"
+    ok "Baseline PG successfully started on port 5434"
   else
-    warn "Baseline PG could not be auto-started. Start it manually if needed."
+    err "Baseline PG is STILL not responding. Database is offline!"
+    exit 1
   fi
 fi
 
@@ -103,6 +112,11 @@ if [ -n "$PID_4000" ]; then
 fi
 
 cd "$PROJECT_DIR/backend"
+
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
+nvm use 18 # Ensure we are using modern Node
+
 nohup npm run dev > "$LOG_DIR/backend.log" 2>&1 &
 BACKEND_PID=$!
 sleep 3

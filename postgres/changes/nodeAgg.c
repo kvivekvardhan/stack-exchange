@@ -273,7 +273,6 @@
 #include "utils/dynahash.h"
 #include "utils/expandeddatum.h"
 #include "utils/logtape.h"
-#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
 #include "utils/tuplesort.h"
@@ -370,6 +369,116 @@ typedef struct FindColsContext
 static void select_current_set(AggState *aggstate, int setno, bool is_hash);
 static void initialize_phase(AggState *aggstate, int newphase);
 
+#define VEC_AGG_INIT_CAP 16
+
+static void
+ExecVecAggReset(AggState *aggstate)
+{
+	aggstate->vec_agg_ngroups = 0;
+	aggstate->vec_agg_emit_index = 0;
+}
+
+static int
+ExecVecAggFindOrAddGroup(AggState *aggstate, int32 key)
+{
+	int			i;
+
+	for (i = 0; i < aggstate->vec_agg_ngroups; i++)
+	{
+		if (aggstate->vec_agg_keys[i] == key)
+			return i;
+	}
+
+	if (aggstate->vec_agg_ngroups >= aggstate->vec_agg_cap)
+	{
+		int			oldcap = aggstate->vec_agg_cap;
+		int			newcap = (oldcap <= 0) ? VEC_AGG_INIT_CAP : oldcap * 2;
+
+		aggstate->vec_agg_keys = (int32 *) repalloc(aggstate->vec_agg_keys,
+													newcap * sizeof(int32));
+		aggstate->vec_agg_sum_i64 = (int64 *) repalloc(aggstate->vec_agg_sum_i64,
+													   newcap * sizeof(int64));
+		aggstate->vec_agg_count = (int64 *) repalloc(aggstate->vec_agg_count,
+													 newcap * sizeof(int64));
+		memset(aggstate->vec_agg_sum_i64 + oldcap, 0,
+			   (newcap - oldcap) * sizeof(int64));
+		memset(aggstate->vec_agg_count + oldcap, 0,
+			   (newcap - oldcap) * sizeof(int64));
+		aggstate->vec_agg_cap = newcap;
+	}
+
+	i = aggstate->vec_agg_ngroups++;
+	aggstate->vec_agg_keys[i] = key;
+	aggstate->vec_agg_sum_i64[i] = 0;
+	aggstate->vec_agg_count[i] = 0;
+	return i;
+}
+
+static AttrNumber
+ExecVecAggSlotAttnum(TupleTableSlot *slot, AttrNumber rel_attno, const char *attname)
+{
+	TupleDesc	desc;
+	int			i;
+
+	if (slot == NULL || slot->tts_tupleDescriptor == NULL)
+		return InvalidAttrNumber;
+
+	desc = slot->tts_tupleDescriptor;
+	if (AttributeNumberIsValid(rel_attno) && rel_attno <= desc->natts)
+	{
+		Form_pg_attribute attr = TupleDescAttr(desc, rel_attno - 1);
+
+		if (!attr->attisdropped && strcmp(NameStr(attr->attname), attname) == 0)
+			return rel_attno;
+	}
+
+	for (i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(desc, i);
+
+		if (!attr->attisdropped && strcmp(NameStr(attr->attname), attname) == 0)
+			return i + 1;
+	}
+
+	return InvalidAttrNumber;
+}
+
+static bool
+ExecVecAggAccumulateSlot(AggState *aggstate, ScanState *scan, TupleTableSlot *slot)
+{
+	bool		isnull;
+	Datum		group_d;
+	Datum		score_d;
+	int32		group_key;
+	int			group_index;
+	AttrNumber	group_attno;
+	AttrNumber	score_attno;
+
+	if (slot == NULL || TupIsNull(slot) ||
+		!AttributeNumberIsValid(scan->vec_att_posttype) ||
+		!AttributeNumberIsValid(scan->vec_att_score))
+		return false;
+
+	group_attno = ExecVecAggSlotAttnum(slot, scan->vec_att_posttype, "posttypeid");
+	score_attno = ExecVecAggSlotAttnum(slot, scan->vec_att_score, "score");
+	if (!AttributeNumberIsValid(group_attno) ||
+		!AttributeNumberIsValid(score_attno))
+		return false;
+
+	group_d = slot_getattr(slot, group_attno, &isnull);
+	if (isnull)
+		return true;
+	group_key = DatumGetInt32(group_d);
+
+	score_d = slot_getattr(slot, score_attno, &isnull);
+	group_index = ExecVecAggFindOrAddGroup(aggstate, group_key);
+	if (!isnull)
+		aggstate->vec_agg_sum_i64[group_index] += (int64) DatumGetInt32(score_d);
+	aggstate->vec_agg_count[group_index]++;
+
+	return true;
+}
+
 static bool
 ExecVecAggMatchesAggrefs(AggState *aggstate, ScanState *scan)
 {
@@ -410,7 +519,7 @@ ExecVecAggMatchesAggrefs(AggState *aggstate, ScanState *scan)
 		if (tle == NULL || tle->expr == NULL || !IsA(tle->expr, Var))
 			return false;
 		v = castNode(Var, tle->expr);
-		if (v->varattno != scan->vec_att_score || v->vartype != INT4OID)
+		if (v->vartype != INT4OID)
 			return false;
 		if (strcmp(aggname, "avg") != 0 ||
 			aggref->aggtype != NUMERICOID || seen_avg)
@@ -443,10 +552,10 @@ ExecVecAgg(AggState *aggstate)
 	econtext = aggstate->ss.ps.ps_ExprContext;
 	projInfo = aggstate->ss.ps.ps_ProjInfo;
 
-	if (!scan->vec_active || !scan->vec_agg_enabled ||
-		scan->vec_agg_keys == NULL ||
-		scan->vec_agg_sum_i64 == NULL ||
-		scan->vec_agg_count == NULL ||
+	if (!scan->vec_active ||
+		aggstate->vec_agg_keys == NULL ||
+		aggstate->vec_agg_sum_i64 == NULL ||
+		aggstate->vec_agg_count == NULL ||
 		aggstate->aggsplit != AGGSPLIT_SIMPLE ||
 		(aggstate->aggstrategy != AGG_PLAIN &&
 		 aggstate->aggstrategy != AGG_SORTED) ||
@@ -460,8 +569,7 @@ ExecVecAgg(AggState *aggstate)
 
 	if (aggnode->numCols != 1 ||
 		aggnode->grpColIdx == NULL ||
-		!AttributeNumberIsValid(scan->vec_att_posttype) ||
-		aggnode->grpColIdx[0] != scan->vec_att_posttype)
+		aggnode->grpColIdx[0] <= 0)
 		return NULL;
 
 	grp_attno = aggnode->grpColIdx[0];
@@ -477,32 +585,38 @@ ExecVecAgg(AggState *aggstate)
 	if (!aggstate->vec_agg_drained)
 	{
 		TupleTableSlot *s;
+
+		ExecVecAggReset(aggstate);
 		while ((s = ExecProcNode(outer)) != NULL && !TupIsNull(s))
+		{
+			if (!ExecVecAggAccumulateSlot(aggstate, scan, s))
+				return NULL;
 			CHECK_FOR_INTERRUPTS();
+		}
 		aggstate->vec_agg_drained = true;
 		aggstate->vec_agg_emit_index = 0;
 	}
 
 	for (;;)
 	{
-		if (aggstate->vec_agg_emit_index >= scan->vec_agg_ngroups)
+		if (aggstate->vec_agg_emit_index >= aggstate->vec_agg_ngroups)
 		{
 			aggstate->agg_done = true;
 			return NULL;
 		}
 
 		g = aggstate->vec_agg_emit_index++;
-		if (scan->vec_agg_count[g] == 0)
+		if (aggstate->vec_agg_count[g] == 0)
 			continue;
 
 		MemSet(econtext->ecxt_aggvalues, 0, aggstate->numaggs * sizeof(Datum));
 		MemSet(econtext->ecxt_aggnulls, true, aggstate->numaggs * sizeof(bool));
 
 		{
-			Datum avg_sum_numeric = DirectFunctionCall1(int8_numeric, Int64GetDatum(scan->vec_agg_sum_i64[g]));
-			Datum avg_count_numeric = DirectFunctionCall1(int8_numeric, Int64GetDatum(scan->vec_agg_count[g]));
+			Datum avg_sum_numeric = DirectFunctionCall1(int8_numeric, Int64GetDatum(aggstate->vec_agg_sum_i64[g]));
+			Datum avg_count_numeric = DirectFunctionCall1(int8_numeric, Int64GetDatum(aggstate->vec_agg_count[g]));
 			Datum avg_val = DirectFunctionCall2(numeric_div, avg_sum_numeric, avg_count_numeric);
-			Datum count_val = Int64GetDatum(scan->vec_agg_count[g]);
+			Datum count_val = Int64GetDatum(aggstate->vec_agg_count[g]);
 			ListCell *lc;
 
 			foreach(lc, aggstate->aggs)
@@ -524,7 +638,7 @@ ExecVecAgg(AggState *aggstate)
 		ExecClearTuple(outer_slot);
 		MemSet(outer_slot->tts_values, 0, outer_slot->tts_tupleDescriptor->natts * sizeof(Datum));
 		MemSet(outer_slot->tts_isnull, true, outer_slot->tts_tupleDescriptor->natts * sizeof(bool));
-		outer_slot->tts_values[grp_attno - 1] = Int32GetDatum(scan->vec_agg_keys[g]);
+		outer_slot->tts_values[grp_attno - 1] = Int32GetDatum(aggstate->vec_agg_keys[g]);
 		outer_slot->tts_isnull[grp_attno - 1] = false;
 		ExecStoreVirtualTuple(outer_slot);
 
@@ -2321,10 +2435,6 @@ ExecAgg(PlanState *pstate)
 			ScanState *scan = (ScanState *) outer;
 			node->vec_agg_enabled =
 				scan->vec_active &&
-				scan->vec_agg_enabled &&
-				scan->vec_agg_keys != NULL &&
-				scan->vec_agg_sum_i64 != NULL &&
-				scan->vec_agg_count != NULL &&
 				AttributeNumberIsValid(scan->vec_att_posttype) &&
 				AttributeNumberIsValid(scan->vec_att_score) &&
 				node->aggsplit == AGGSPLIT_SIMPLE &&
@@ -2333,13 +2443,26 @@ ExecAgg(PlanState *pstate)
 				aggnode != NULL &&
 				aggnode->numCols == 1 &&
 				aggnode->grpColIdx != NULL &&
-				aggnode->grpColIdx[0] == scan->vec_att_posttype &&
+				aggnode->grpColIdx[0] > 0 &&
 				aggnode->groupingSets == NIL &&
 				node->numaggs == 2 &&
 				node->ss.ps.qual == NULL &&
 				ExecVecAggMatchesAggrefs(node, scan);
 			node->vec_agg_drained = false;
 			node->vec_agg_emit_index = 0;
+			node->vec_agg_ngroups = 0;
+			node->vec_agg_cap = 0;
+			node->vec_agg_keys = NULL;
+			node->vec_agg_sum_i64 = NULL;
+			node->vec_agg_count = NULL;
+
+			if (node->vec_agg_enabled)
+			{
+				node->vec_agg_keys = (int32 *) palloc(VEC_AGG_INIT_CAP * sizeof(int32));
+				node->vec_agg_sum_i64 = (int64 *) palloc0(VEC_AGG_INIT_CAP * sizeof(int64));
+				node->vec_agg_count = (int64 *) palloc0(VEC_AGG_INIT_CAP * sizeof(int64));
+				node->vec_agg_cap = VEC_AGG_INIT_CAP;
+			}
 		}
 	}
 	if (node->vec_agg_enabled)
@@ -3411,6 +3534,11 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 	aggstate->vec_agg_enabled = false;
 	aggstate->vec_agg_drained = false;
 	aggstate->vec_agg_emit_index = 0;
+	aggstate->vec_agg_keys = NULL;
+	aggstate->vec_agg_sum_i64 = NULL;
+	aggstate->vec_agg_count = NULL;
+	aggstate->vec_agg_ngroups = 0;
+	aggstate->vec_agg_cap = 0;
 	aggstate->pergroups = NULL;
 	aggstate->grp_firstTuple = NULL;
 	aggstate->sort_in = NULL;

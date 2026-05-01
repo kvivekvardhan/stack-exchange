@@ -19,13 +19,16 @@
 #include "postgres.h"
 #include "executor/tuptable.h"
 
+#include "catalog/pg_attribute.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "catalog/pg_type_d.h"
 #include "utils/rel.h"
 #include "access/relscan.h"
 #include "utils/memutils.h"
+#include "utils/lsyscache.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 
@@ -167,138 +170,76 @@ ExecScanFetch(ScanState *node,
  *			 "cursor" is positioned before the first qualifying tuple.
  * ----------------------------------------------------------------
  */
-/* VECTORIZED: relation-specific modes */
-typedef enum VecRelationKind
-{
-    VEC_REL_NONE = 0,
-    VEC_REL_SE_POSTS,
-    VEC_REL_QUESTIONS
-} VecRelationKind;
-
-/* VECTORIZED: column positions for se_posts schema */
-#define VEC_COL_POSTTYPE      2   /* PostTypeId */
-#define VEC_COL_SCORE         3   /* Score */
-#define VEC_COL_VIEWCOUNT     4   /* ViewCount */
-
 #define VEC_BATCH_SIZE      1000
-#define VEC_AGG_INIT_CAP      16
-
-/* VECTORIZED: detect exact se_posts schema */
-static bool
-vec_is_se_posts_relation(ScanState *node)
+/* VECTORIZED: lookup helpers for real table schemas, not hardcoded layouts. */
+static AttrNumber
+vec_get_attnum(Oid relid, const char *name)
 {
-    TupleDesc desc;
-    int i;
+    AttrNumber attno;
 
-    if (node->ss_currentRelation == NULL)
+    attno = get_attnum(relid, name);
+    if (AttributeNumberIsValid(attno))
+        return attno;
+
+    return InvalidAttrNumber;
+}
+
+static bool
+vec_att_is_int4(TupleDesc desc, AttrNumber attno)
+{
+    Form_pg_attribute attr;
+
+    if (desc == NULL || !AttributeNumberIsValid(attno) || attno > desc->natts)
         return false;
 
-    if (strcmp(RelationGetRelationName(node->ss_currentRelation), "se_posts") != 0)
+    attr = TupleDescAttr(desc, attno - 1);
+    if (attr->attisdropped)
+        return false;
+
+    return attr->atttypid == INT4OID;
+}
+
+static bool
+vec_resolve_relation_attrs(ScanState *node)
+{
+    Oid relid;
+    TupleDesc desc;
+
+    node->vec_target_oid = InvalidOid;
+    node->vec_att_posttype = InvalidAttrNumber;
+    node->vec_att_score = InvalidAttrNumber;
+    node->vec_att_viewcount = InvalidAttrNumber;
+
+    if (node->ss_currentRelation == NULL || node->ss_ScanTupleSlot == NULL)
         return false;
 
     desc = node->ss_ScanTupleSlot->tts_tupleDescriptor;
-    if (desc == NULL || desc->natts != 7)
+    if (desc == NULL)
         return false;
 
-    /*
-     * Expected schema:
-     * (id, posttypeid, score, viewcount, answercount, commentcount, favoritecount)
-     * all int4
-     */
-    for (i = 0; i < 7; i++)
-    {
-        Form_pg_attribute attr = TupleDescAttr(desc, i);
-        if (attr->attisdropped)
-            return false;
-        if (attr->atttypid != INT4OID)
-            return false;
-    }
+    relid = RelationGetRelid(node->ss_currentRelation);
+    if (!OidIsValid(relid))
+        return false;
+
+    node->vec_target_oid = relid;
+    node->vec_att_posttype = vec_get_attnum(relid, "posttypeid");
+    node->vec_att_score = vec_get_attnum(relid, "score");
+    node->vec_att_viewcount = vec_get_attnum(relid, "viewcount");
+
+    if (!AttributeNumberIsValid(node->vec_att_viewcount))
+        node->vec_att_viewcount = vec_get_attnum(relid, "views");
+
+    if (AttributeNumberIsValid(node->vec_att_posttype) &&
+        !vec_att_is_int4(desc, node->vec_att_posttype))
+        node->vec_att_posttype = InvalidAttrNumber;
+    if (AttributeNumberIsValid(node->vec_att_score) &&
+        !vec_att_is_int4(desc, node->vec_att_score))
+        node->vec_att_score = InvalidAttrNumber;
+    if (AttributeNumberIsValid(node->vec_att_viewcount) &&
+        !vec_att_is_int4(desc, node->vec_att_viewcount))
+        node->vec_att_viewcount = InvalidAttrNumber;
 
     return true;
-}
-
-/* VECTORIZED: detect exact questions schema used by main app endpoints */
-static bool
-vec_is_questions_relation(ScanState *node)
-{
-    TupleDesc desc;
-    static const Oid expected[7] = {
-        INT4OID,        /* id */
-        TEXTOID,        /* title */
-        TEXTOID,        /* body */
-        TEXTOID,        /* asked_by */
-        INT4OID,        /* score */
-        INT4OID,        /* views */
-        TIMESTAMPTZOID  /* created_at */
-    };
-    int i;
-
-    if (node->ss_currentRelation == NULL)
-        return false;
-
-    if (strcmp(RelationGetRelationName(node->ss_currentRelation), "questions") != 0)
-        return false;
-
-    desc = node->ss_ScanTupleSlot->tts_tupleDescriptor;
-    if (desc == NULL || desc->natts != 7)
-        return false;
-
-    for (i = 0; i < 7; i++)
-    {
-        Form_pg_attribute attr = TupleDescAttr(desc, i);
-        if (attr->attisdropped)
-            return false;
-        if (attr->atttypid != expected[i])
-            return false;
-    }
-
-    return true;
-}
-
-static VecRelationKind
-vec_detect_target_relation(ScanState *node)
-{
-    if (vec_is_se_posts_relation(node))
-        return VEC_REL_SE_POSTS;
-    if (vec_is_questions_relation(node))
-        return VEC_REL_QUESTIONS;
-    return VEC_REL_NONE;
-}
-
-static inline void
-vec_agg_reset(ScanState *node)
-{
-    node->vec_agg_ngroups = 0;
-    node->vec_agg_logged = false;
-}
-
-static int
-vec_agg_find_or_add_group(ScanState *node, int32 key)
-{
-    int i;
-
-    for (i = 0; i < node->vec_agg_ngroups; i++)
-    {
-        if (node->vec_agg_keys[i] == key)
-            return i;
-    }
-
-    if (node->vec_agg_ngroups >= node->vec_agg_cap)
-    {
-        int newcap = (node->vec_agg_cap <= 0) ? VEC_AGG_INIT_CAP : node->vec_agg_cap * 2;
-        node->vec_agg_keys = (int32 *) repalloc(node->vec_agg_keys, newcap * sizeof(int32));
-        node->vec_agg_sum_i64 = (int64 *) repalloc(node->vec_agg_sum_i64, newcap * sizeof(int64));
-        node->vec_agg_count = (int64 *) repalloc(node->vec_agg_count, newcap * sizeof(int64));
-        memset(node->vec_agg_sum_i64 + node->vec_agg_cap, 0, (newcap - node->vec_agg_cap) * sizeof(int64));
-        memset(node->vec_agg_count + node->vec_agg_cap, 0, (newcap - node->vec_agg_cap) * sizeof(int64));
-        node->vec_agg_cap = newcap;
-    }
-
-    i = node->vec_agg_ngroups++;
-    node->vec_agg_keys[i] = key;
-    node->vec_agg_sum_i64[i] = 0;
-    node->vec_agg_count[i] = 0;
-    return i;
 }
 
 TupleTableSlot *
@@ -319,34 +260,20 @@ ExecScan(ScanState *node,
     if (!node->vec_init)
     {
         const char *pg_vec = getenv("PG_VECTORIZED");
-        VecRelationKind relkind = vec_detect_target_relation(node);
+        bool has_relation = vec_resolve_relation_attrs(node);
 
         {
             bool is_parallel = (node->ss_currentScanDesc != NULL &&
                                 node->ss_currentScanDesc->rs_parallel != NULL);
             node->vec_active = (pg_vec != NULL &&
                                 strcmp(pg_vec, "1") == 0 &&
-                                relkind != VEC_REL_NONE &&
+                                has_relation &&
                                 !is_parallel);
         }
         node->vec_init = true;
 
         if (node->vec_active)
         {
-            if (relkind == VEC_REL_SE_POSTS)
-            {
-                node->vec_agg_keys = (int32 *) palloc(VEC_AGG_INIT_CAP * sizeof(int32));
-                node->vec_agg_sum_i64 = (int64 *) palloc0(VEC_AGG_INIT_CAP * sizeof(int64));
-                node->vec_agg_count = (int64 *) palloc0(VEC_AGG_INIT_CAP * sizeof(int64));
-                node->vec_agg_ngroups = 0;
-                node->vec_agg_cap = VEC_AGG_INIT_CAP;
-                node->vec_agg_enabled = true;
-            }
-            else
-            {
-                node->vec_agg_enabled = false;
-            }
-            node->vec_agg_logged = false;
             node->vec_passed = 0;
             node->vec_filtered = 0;
             node->vec_total_passed = 0;
@@ -393,25 +320,6 @@ ExecScan(ScanState *node,
                     ResetExprContext(econtext);
 
                     /*
-                     * se_posts fast-path:
-                     * Apply cheap inline pre-filter before ExecQual.
-                     * questions fast-path:
-                     * Skip this pre-filter and rely on ExecQual to preserve semantics.
-                     */
-                    if (node->vec_agg_enabled)
-                    {
-                        bool isnull;
-                        Datum d;
-                        int32 views;
-
-                        d = heap_getattr(tup, VEC_COL_VIEWCOUNT,
-                                         node->ss_ScanTupleSlot->tts_tupleDescriptor, &isnull);
-                        views = isnull ? 0 : DatumGetInt32(d);
-                        if (qual != NULL && views <= 100)
-                            pass = false;
-                    }
-
-                    /*
                      * Preserve correctness for all quals by evaluating ExecQual on
                      * the tuple we just batched.
                      */
@@ -437,23 +345,6 @@ ExecScan(ScanState *node,
                     node->vec_passed++;
                     node->vec_total_passed++;
 
-                    if (node->vec_agg_enabled)
-                    {
-                        bool isnull;
-                        Datum d = heap_getattr(tup, VEC_COL_POSTTYPE,
-                                               node->ss_ScanTupleSlot->tts_tupleDescriptor, &isnull);
-                        int32 type_id = isnull ? 0 : DatumGetInt32(d);
-
-                        if (!isnull)
-                        {
-                            int gidx = vec_agg_find_or_add_group(node, type_id);
-                            Datum score_d = heap_getattr(tup, VEC_COL_SCORE,
-                                                         node->ss_ScanTupleSlot->tts_tupleDescriptor, &isnull);
-                            if (!isnull)
-                                node->vec_agg_sum_i64[gidx] += (int64) DatumGetInt32(score_d);
-                            node->vec_agg_count[gidx]++;
-                        }
-                    }
                 }
             }
 
@@ -474,22 +365,8 @@ ExecScan(ScanState *node,
 
             if (node->vec_batch_done)
             {
-                /* Scan complete — log aggregate results */
-                if (node->vec_agg_enabled && !node->vec_agg_logged)
-                {
-                    int i;
-                    for (i = 0; i < node->vec_agg_ngroups; i++)
-                    {
-                        if (node->vec_agg_count[i] == 0) continue;
-                        elog(LOG, "VECTORIZED AGG: PostType=%d avg_score=%.4f count=" INT64_FORMAT,
-                             node->vec_agg_keys[i],
-                             (double) node->vec_agg_sum_i64[i] / (double) node->vec_agg_count[i],
-                             node->vec_agg_count[i]);
-                    }
-                    elog(LOG, "VECTORIZED SCAN TOTAL: " INT64_FORMAT " passed, " INT64_FORMAT " filtered",
-                         node->vec_total_passed, node->vec_total_filtered);
-                    node->vec_agg_logged = true;
-                }
+                elog(LOG, "VECTORIZED SCAN TOTAL: " INT64_FORMAT " passed, " INT64_FORMAT " filtered",
+                     node->vec_total_passed, node->vec_total_filtered);
                 return NULL;
             }
             continue;
@@ -616,6 +493,5 @@ ExecScanReScan(ScanState *node)
 		node->vec_batch_count = 0;
 		node->vec_batch_index = 0;
 		node->vec_batch_done = false;
-		vec_agg_reset(node);
 	}
 }

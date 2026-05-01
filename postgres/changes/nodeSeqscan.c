@@ -32,7 +32,11 @@
 #include "access/tableam.h"
 #include "executor/execdebug.h"
 #include "executor/nodeSeqscan.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
+
+#include <stdlib.h>
+#include <string.h>
 
 static TupleTableSlot *SeqNext(SeqScanState *node);
 
@@ -178,15 +182,19 @@ ExecInitSeqScan(SeqScan *node, EState *estate, int eflags)
 	/*
 	 * VECTORIZED: initialize batch tracking state.
 	 *
-	 * vec_active = true tells EXPLAIN ANALYZE to label this node
-	 * "Vectorized Seq Scan" (see explain.c).  The remaining fields track
-	 * batch boundaries that are logged via DEBUG1 messages in SeqNext.
+	 * ExecScan resolves the real relation metadata and sets vec_active when
+	 * PG_VECTORIZED=1 and the scan can safely use the vectorized path.
 	 */
-	scanstate->ss.vec_active		= true;
+	scanstate->ss.vec_init		= false;
+	scanstate->ss.vec_active		= false;
 	scanstate->ss.vec_passed		= 0;
 	scanstate->ss.vec_filtered		= 0;
 	scanstate->ss.vec_total_passed	= 0;
 	scanstate->ss.vec_total_filtered= 0;
+	scanstate->ss.vec_target_oid	= InvalidOid;
+	scanstate->ss.vec_att_posttype	= InvalidAttrNumber;
+	scanstate->ss.vec_att_score	= InvalidAttrNumber;
+	scanstate->ss.vec_att_viewcount	= InvalidAttrNumber;
 	scanstate->ss.vec_batch_count	= 0;
 	scanstate->ss.vec_batch_index	= 0;
 	scanstate->ss.vec_batch_done	= false;
@@ -212,6 +220,28 @@ ExecInitSeqScan(SeqScan *node, EState *estate, int eflags)
 	ExecInitScanTupleSlot(estate, &scanstate->ss,
 						  RelationGetDescr(scanstate->ss.ss_currentRelation),
 						  table_slot_callbacks(scanstate->ss.ss_currentRelation));
+
+	/*
+	 * VECTORIZED: initialize relation attribute mapping early enough for an
+	 * Agg node above this scan to decide whether its AVG/COUNT fast path is
+	 * eligible before it drains the scan.
+	 */
+	{
+		const char *pg_vec = getenv("PG_VECTORIZED");
+		Oid relid = RelationGetRelid(scanstate->ss.ss_currentRelation);
+
+		scanstate->ss.vec_att_posttype = get_attnum(relid, "posttypeid");
+		scanstate->ss.vec_att_score = get_attnum(relid, "score");
+		scanstate->ss.vec_att_viewcount = get_attnum(relid, "viewcount");
+		if (!AttributeNumberIsValid(scanstate->ss.vec_att_viewcount))
+			scanstate->ss.vec_att_viewcount = get_attnum(relid, "views");
+
+		scanstate->ss.vec_active =
+			pg_vec != NULL &&
+			strcmp(pg_vec, "1") == 0 &&
+			AttributeNumberIsValid(scanstate->ss.vec_att_posttype) &&
+			AttributeNumberIsValid(scanstate->ss.vec_att_score);
+	}
 
 	/*
 	 * Initialize result type and projection.

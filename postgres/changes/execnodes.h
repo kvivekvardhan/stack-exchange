@@ -1488,15 +1488,6 @@ typedef struct ScanState
     AttrNumber  vec_att_score;      /* attno of Score / score */
     AttrNumber  vec_att_viewcount;  /* attno of ViewCount / view_count (optional) */
 
-    /* VECTORIZED: aggregate state (dynamic groups keyed on PostTypeId) */
-    int32      *vec_agg_keys;       /* group key values (PostTypeId) */
-    int64      *vec_agg_sum_i64;    /* exact sum(score) per group */
-    int64      *vec_agg_count;      /* count(*) per group */
-    int         vec_agg_ngroups;    /* number of active groups */
-    int         vec_agg_cap;        /* allocated capacity of arrays */
-    bool        vec_agg_enabled;    /* enable aggregate tracking */
-    bool        vec_agg_logged;     /* aggregate results logged */
-
     /* VECTORIZED: batch tracking */
     int         vec_batch_count;
     int         vec_batch_index;
@@ -2484,6 +2475,11 @@ typedef struct AggState
 	bool		vec_agg_enabled;	/* using vectorized aggregate output */
 	bool		vec_agg_drained;	/* outer scan fully drained */
 	int		vec_agg_emit_index; /* next dynamic aggregate-group index */
+	int32	   *vec_agg_keys;	/* group key values */
+	int64	   *vec_agg_sum_i64; /* exact sum(score) per group */
+	int64	   *vec_agg_count;	/* count(*) per group */
+	int		vec_agg_ngroups;	/* number of active groups */
+	int		vec_agg_cap;		/* allocated capacity of arrays */
 } AggState;
 
 /* ----------------

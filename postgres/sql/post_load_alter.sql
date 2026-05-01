@@ -5,8 +5,8 @@
 --      /answers, /comments, /upvote can INSERT without explicit IDs.
 --   3. Sequence-restart values bumped past the bulk-loaded max(id).
 -- Apply to BOTH clusters:
---   psql -h 127.0.0.1 -p 5434 -U madhav -d stackfast -f post_load_alter.sql
---   psql -h 127.0.0.1 -p 5433 -U madhav -d stackfast -f post_load_alter.sql
+--   psql -h 127.0.0.1 -p 5434 -U madhav -d stackfast -f /path/to/post_load_alter.sql
+--   psql -h 127.0.0.1 -p 5433 -U madhav -d stackfast -f /path/to/post_load_alter.sql
 
 -- 1. tag-upsert support (idempotent).
 DO $$

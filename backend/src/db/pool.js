@@ -46,6 +46,10 @@ const vectorPool = new Pool(
   buildPoolConfig(process.env.VECTOR_DATABASE_URL || process.env.DATABASE_URL)
 );
 
+function shouldDisableParallelScans(engine) {
+  return engine === "baseline" || engine === "vectorized";
+}
+
 function handlePoolError(label) {
   return (error) => {
     console.error(`Unexpected PostgreSQL pool error (${label})`, error);
@@ -71,6 +75,10 @@ export async function query(text, params = []) {
 }
 
 export async function queryWithEngine(engine, text, params = []) {
+  if (shouldDisableParallelScans(engine)) {
+    return withTransactionEngine(engine, (client) => client.query(text, params));
+  }
+
   return resolvePool(engine).query(text, params);
 }
 
@@ -93,6 +101,9 @@ export async function withTransactionEngine(engine, work) {
   const client = await resolvePool(engine).connect();
   try {
     await client.query("BEGIN");
+    if (shouldDisableParallelScans(engine)) {
+      await client.query("SET LOCAL max_parallel_workers_per_gather = 0");
+    }
     const result = await work(client);
     await client.query("COMMIT");
     return result;
