@@ -33,6 +33,14 @@ if ! grep -q "Custom Scan (Vectorized Seq Scan)" <<<"$PLAN"; then
   exit 1
 fi
 
+AGG_PLAN="$("${PSQL[@]}" -t -A -c "SET vectorized_scan = on; EXPLAIN SELECT posttypeid, AVG(score), COUNT(*) FROM posts GROUP BY posttypeid;")"
+echo "$AGG_PLAN"
+
+if ! grep -q "Custom Scan (Vectorized Seq Scan)" <<<"$AGG_PLAN"; then
+  echo "ERROR: expected vectorized aggregate input to use Custom Scan (Vectorized Seq Scan)." >&2
+  exit 1
+fi
+
 echo ""
 echo "[3/3] Running SQL correctness checks..."
 "${PSQL[@]}" -f "$CHECK_SQL"

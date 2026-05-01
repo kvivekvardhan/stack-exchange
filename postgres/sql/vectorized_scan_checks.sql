@@ -1,4 +1,5 @@
 \set ON_ERROR_STOP on
+SET max_parallel_workers_per_gather = 0;
 
 \echo 'Vectorized scan checks: plain LIMIT projection'
 WITH sample AS (
@@ -152,6 +153,38 @@ BEGIN
 
     IF null_count <= 0 THEN
         RAISE EXCEPTION 'acceptedanswerid IS NULL returned no rows';
+    END IF;
+END $$;
+
+\echo 'Vectorized scan checks: grouped AVG/COUNT aggregate'
+SET vectorized_scan = off;
+DROP TABLE IF EXISTS expected_vecagg;
+CREATE TEMP TABLE expected_vecagg AS
+SELECT posttypeid, AVG(score) AS avg_score, COUNT(*) AS row_count
+FROM posts
+GROUP BY posttypeid;
+
+SET vectorized_scan = on;
+DROP TABLE IF EXISTS actual_vecagg;
+CREATE TEMP TABLE actual_vecagg AS
+SELECT posttypeid, AVG(score) AS avg_score, COUNT(*) AS row_count
+FROM posts
+GROUP BY posttypeid;
+
+DO $$
+DECLARE
+    mismatch_count integer;
+BEGIN
+    SELECT COUNT(*)
+    INTO mismatch_count
+    FROM (
+        (SELECT * FROM expected_vecagg EXCEPT SELECT * FROM actual_vecagg)
+        UNION ALL
+        (SELECT * FROM actual_vecagg EXCEPT SELECT * FROM expected_vecagg)
+    ) diff;
+
+    IF mismatch_count > 0 THEN
+        RAISE EXCEPTION 'vectorized grouped AVG/COUNT aggregate had % mismatched rows', mismatch_count;
     END IF;
 END $$;
 

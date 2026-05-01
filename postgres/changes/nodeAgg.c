@@ -378,6 +378,12 @@ ExecVecAggReset(AggState *aggstate)
 	aggstate->vec_agg_emit_index = 0;
 }
 
+static bool
+ExecVecAggStrategySupported(AggStrategy strategy)
+{
+	return strategy == AGG_HASHED || strategy == AGG_SORTED;
+}
+
 static int
 ExecVecAggFindOrAddGroup(AggState *aggstate, int32 key)
 {
@@ -394,13 +400,27 @@ ExecVecAggFindOrAddGroup(AggState *aggstate, int32 key)
 		int			oldcap = aggstate->vec_agg_cap;
 		int			newcap = (oldcap <= 0) ? VEC_AGG_INIT_CAP : oldcap * 2;
 
-		aggstate->vec_agg_keys = (int32 *) repalloc(aggstate->vec_agg_keys,
-													newcap * sizeof(int32));
-		aggstate->vec_agg_sum_i64 = (int64 *) repalloc(aggstate->vec_agg_sum_i64,
-													   newcap * sizeof(int64));
-		aggstate->vec_agg_count = (int64 *) repalloc(aggstate->vec_agg_count,
-													 newcap * sizeof(int64));
+		if (oldcap <= 0)
+		{
+			aggstate->vec_agg_keys = (int32 *) palloc0(newcap * sizeof(int32));
+			aggstate->vec_agg_sum_i64 = (int64 *) palloc0(newcap * sizeof(int64));
+			aggstate->vec_agg_score_count = (int64 *) palloc0(newcap * sizeof(int64));
+			aggstate->vec_agg_count = (int64 *) palloc0(newcap * sizeof(int64));
+		}
+		else
+		{
+			aggstate->vec_agg_keys = (int32 *) repalloc(aggstate->vec_agg_keys,
+														newcap * sizeof(int32));
+			aggstate->vec_agg_sum_i64 = (int64 *) repalloc(aggstate->vec_agg_sum_i64,
+														   newcap * sizeof(int64));
+			aggstate->vec_agg_score_count = (int64 *) repalloc(aggstate->vec_agg_score_count,
+															   newcap * sizeof(int64));
+			aggstate->vec_agg_count = (int64 *) repalloc(aggstate->vec_agg_count,
+														 newcap * sizeof(int64));
+		}
 		memset(aggstate->vec_agg_sum_i64 + oldcap, 0,
+			   (newcap - oldcap) * sizeof(int64));
+		memset(aggstate->vec_agg_score_count + oldcap, 0,
 			   (newcap - oldcap) * sizeof(int64));
 		memset(aggstate->vec_agg_count + oldcap, 0,
 			   (newcap - oldcap) * sizeof(int64));
@@ -410,59 +430,26 @@ ExecVecAggFindOrAddGroup(AggState *aggstate, int32 key)
 	i = aggstate->vec_agg_ngroups++;
 	aggstate->vec_agg_keys[i] = key;
 	aggstate->vec_agg_sum_i64[i] = 0;
+	aggstate->vec_agg_score_count[i] = 0;
 	aggstate->vec_agg_count[i] = 0;
 	return i;
 }
 
-static AttrNumber
-ExecVecAggSlotAttnum(TupleTableSlot *slot, AttrNumber rel_attno, const char *attname)
-{
-	TupleDesc	desc;
-	int			i;
-
-	if (slot == NULL || slot->tts_tupleDescriptor == NULL)
-		return InvalidAttrNumber;
-
-	desc = slot->tts_tupleDescriptor;
-	if (AttributeNumberIsValid(rel_attno) && rel_attno <= desc->natts)
-	{
-		Form_pg_attribute attr = TupleDescAttr(desc, rel_attno - 1);
-
-		if (!attr->attisdropped && strcmp(NameStr(attr->attname), attname) == 0)
-			return rel_attno;
-	}
-
-	for (i = 0; i < desc->natts; i++)
-	{
-		Form_pg_attribute attr = TupleDescAttr(desc, i);
-
-		if (!attr->attisdropped && strcmp(NameStr(attr->attname), attname) == 0)
-			return i + 1;
-	}
-
-	return InvalidAttrNumber;
-}
-
 static bool
-ExecVecAggAccumulateSlot(AggState *aggstate, ScanState *scan, TupleTableSlot *slot)
+ExecVecAggAccumulateSlot(AggState *aggstate, TupleTableSlot *slot,
+						 AttrNumber group_attno, AttrNumber score_attno)
 {
 	bool		isnull;
 	Datum		group_d;
 	Datum		score_d;
 	int32		group_key;
 	int			group_index;
-	AttrNumber	group_attno;
-	AttrNumber	score_attno;
 
-	if (slot == NULL || TupIsNull(slot) ||
-		!AttributeNumberIsValid(scan->vec_att_posttype) ||
-		!AttributeNumberIsValid(scan->vec_att_score))
-		return false;
-
-	group_attno = ExecVecAggSlotAttnum(slot, scan->vec_att_posttype, "posttypeid");
-	score_attno = ExecVecAggSlotAttnum(slot, scan->vec_att_score, "score");
-	if (!AttributeNumberIsValid(group_attno) ||
-		!AttributeNumberIsValid(score_attno))
+	if (slot == NULL || TupIsNull(slot) || slot->tts_tupleDescriptor == NULL ||
+		!AttributeNumberIsValid(group_attno) ||
+		!AttributeNumberIsValid(score_attno) ||
+		group_attno > slot->tts_tupleDescriptor->natts ||
+		score_attno > slot->tts_tupleDescriptor->natts)
 		return false;
 
 	group_d = slot_getattr(slot, group_attno, &isnull);
@@ -473,7 +460,10 @@ ExecVecAggAccumulateSlot(AggState *aggstate, ScanState *scan, TupleTableSlot *sl
 	score_d = slot_getattr(slot, score_attno, &isnull);
 	group_index = ExecVecAggFindOrAddGroup(aggstate, group_key);
 	if (!isnull)
+	{
 		aggstate->vec_agg_sum_i64[group_index] += (int64) DatumGetInt32(score_d);
+		aggstate->vec_agg_score_count[group_index]++;
+	}
 	aggstate->vec_agg_count[group_index]++;
 
 	return true;
@@ -530,6 +520,30 @@ ExecVecAggMatchesAggrefs(AggState *aggstate, ScanState *scan)
 	return seen_avg && seen_count;
 }
 
+static AttrNumber
+ExecVecAggAvgInputAttno(AggState *aggstate)
+{
+	ListCell   *lc;
+
+	foreach(lc, aggstate->aggs)
+	{
+		Aggref	   *aggref = (Aggref *) lfirst(lc);
+		TargetEntry *tle;
+		Var		   *v;
+
+		if (aggref == NULL || aggref->aggstar || list_length(aggref->args) != 1)
+			continue;
+		tle = (TargetEntry *) lfirst(list_head(aggref->args));
+		if (tle == NULL || tle->expr == NULL || !IsA(tle->expr, Var))
+			continue;
+		v = castNode(Var, tle->expr);
+		if (v->vartype == INT4OID)
+			return v->varattno;
+	}
+
+	return InvalidAttrNumber;
+}
+
 static ScanState *
 ExecVecAggOuterScan(PlanState *outer)
 {
@@ -551,6 +565,45 @@ static bool
 ExecVecAggScanReady(ScanState *scan)
 {
 	return scan != NULL && scan->vec_active;
+}
+
+static bool
+ExecVecAggMaybeEnable(AggState *aggstate)
+{
+	Agg		   *aggnode;
+	ScanState  *scan;
+
+	if (aggstate == NULL)
+		return false;
+	if (aggstate->vec_agg_enabled)
+		return true;
+	if (aggstate->vec_agg_drained)
+		return false;
+
+	scan = ExecVecAggOuterScan(outerPlanState(aggstate));
+	if (!ExecVecAggScanReady(scan))
+		return false;
+
+	aggnode = castNode(Agg, aggstate->ss.ps.plan);
+	if (aggnode == NULL ||
+		aggnode->numCols != 1 ||
+		aggnode->grpColIdx == NULL ||
+		aggnode->grpColIdx[0] <= 0 ||
+		aggnode->groupingSets != NIL ||
+		aggstate->numaggs != 2 ||
+		aggstate->aggsplit != AGGSPLIT_SIMPLE ||
+		!ExecVecAggStrategySupported(aggstate->aggstrategy) ||
+		!AttributeNumberIsValid(ExecVecAggAvgInputAttno(aggstate)) ||
+		aggstate->ss.ps.qual != NULL ||
+		!AttributeNumberIsValid(scan->vec_att_posttype) ||
+		!AttributeNumberIsValid(scan->vec_att_score) ||
+		!ExecVecAggMatchesAggrefs(aggstate, scan))
+		return false;
+
+	aggstate->vec_agg_enabled = true;
+	aggstate->vec_agg_drained = false;
+	aggstate->vec_agg_emit_index = 0;
+	return true;
 }
 
 static bool
@@ -586,6 +639,7 @@ ExecVecAgg(AggState *aggstate)
 	TupleTableSlot *result;
 	int		   g;
 	int		   grp_attno;
+	AttrNumber score_attno;
 
 	if (!ExecVecAggReady(aggstate, &scan))
 		return NULL;
@@ -595,12 +649,8 @@ ExecVecAgg(AggState *aggstate)
 	econtext = aggstate->ss.ps.ps_ExprContext;
 	projInfo = aggstate->ss.ps.ps_ProjInfo;
 
-	if (aggstate->vec_agg_keys == NULL ||
-		aggstate->vec_agg_sum_i64 == NULL ||
-		aggstate->vec_agg_count == NULL ||
-		aggstate->aggsplit != AGGSPLIT_SIMPLE ||
-		(aggstate->aggstrategy != AGG_PLAIN &&
-		 aggstate->aggstrategy != AGG_SORTED) ||
+	if (aggstate->aggsplit != AGGSPLIT_SIMPLE ||
+		!ExecVecAggStrategySupported(aggstate->aggstrategy) ||
 		econtext == NULL ||
 		projInfo == NULL ||
 		projInfo->pi_state.resultslot == NULL ||
@@ -615,7 +665,10 @@ ExecVecAgg(AggState *aggstate)
 		return NULL;
 
 	grp_attno = aggnode->grpColIdx[0];
+	score_attno = ExecVecAggAvgInputAttno(aggstate);
 	if (grp_attno <= 0)
+		return NULL;
+	if (!AttributeNumberIsValid(score_attno))
 		return NULL;
 
 	outer_slot = econtext->ecxt_outertuple;
@@ -631,7 +684,7 @@ ExecVecAgg(AggState *aggstate)
 		ExecVecAggReset(aggstate);
 		while ((s = ExecProcNode(outer)) != NULL && !TupIsNull(s))
 		{
-			if (!ExecVecAggAccumulateSlot(aggstate, scan, s))
+			if (!ExecVecAggAccumulateSlot(aggstate, s, grp_attno, score_attno))
 				return NULL;
 			CHECK_FOR_INTERRUPTS();
 		}
@@ -655,11 +708,20 @@ ExecVecAgg(AggState *aggstate)
 		MemSet(econtext->ecxt_aggnulls, true, aggstate->numaggs * sizeof(bool));
 
 		{
-			Datum avg_sum_numeric = DirectFunctionCall1(int8_numeric, Int64GetDatum(aggstate->vec_agg_sum_i64[g]));
-			Datum avg_count_numeric = DirectFunctionCall1(int8_numeric, Int64GetDatum(aggstate->vec_agg_count[g]));
-			Datum avg_val = DirectFunctionCall2(numeric_div, avg_sum_numeric, avg_count_numeric);
+			Datum avg_val = (Datum) 0;
 			Datum count_val = Int64GetDatum(aggstate->vec_agg_count[g]);
 			ListCell *lc;
+			bool avg_isnull = aggstate->vec_agg_score_count[g] == 0;
+
+			if (!avg_isnull)
+			{
+				Datum avg_sum_numeric = DirectFunctionCall1(int8_numeric,
+														   Int64GetDatum(aggstate->vec_agg_sum_i64[g]));
+				Datum avg_count_numeric = DirectFunctionCall1(int8_numeric,
+															 Int64GetDatum(aggstate->vec_agg_score_count[g]));
+
+				avg_val = DirectFunctionCall2(numeric_div, avg_sum_numeric, avg_count_numeric);
+			}
 
 			foreach(lc, aggstate->aggs)
 			{
@@ -672,7 +734,11 @@ ExecVecAgg(AggState *aggstate)
 				if (aggref->aggstar)
 					econtext->ecxt_aggvalues[aggno] = count_val;
 				else
+				{
 					econtext->ecxt_aggvalues[aggno] = avg_val;
+					econtext->ecxt_aggnulls[aggno] = avg_isnull;
+					continue;
+				}
 				econtext->ecxt_aggnulls[aggno] = false;
 			}
 		}
@@ -2467,8 +2533,8 @@ ExecAgg(PlanState *pstate)
 	AggState   *node = castNode(AggState, pstate);
 	TupleTableSlot *result = NULL;
 
-	/* VEC AGG DISABLED PENDING FIX */
-	/* if (ExecVecAggReady(node, NULL)) return ExecVecAgg(node); */
+	if (ExecVecAggMaybeEnable(node))
+		return ExecVecAgg(node);
 
 	CHECK_FOR_INTERRUPTS();
 
@@ -3538,6 +3604,7 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 	aggstate->vec_agg_emit_index = 0;
 	aggstate->vec_agg_keys = NULL;
 	aggstate->vec_agg_sum_i64 = NULL;
+	aggstate->vec_agg_score_count = NULL;
 	aggstate->vec_agg_count = NULL;
 	aggstate->vec_agg_ngroups = 0;
 	aggstate->vec_agg_cap = 0;

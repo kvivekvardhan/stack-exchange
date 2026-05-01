@@ -2480,6 +2480,7 @@ typedef struct AggState
 	int		vec_agg_emit_index; /* next dynamic aggregate-group index */
 	int32	   *vec_agg_keys;	/* group key values */
 	int64	   *vec_agg_sum_i64; /* exact sum(score) per group */
+	int64	   *vec_agg_score_count;	/* non-null score count per group */
 	int64	   *vec_agg_count;	/* count(*) per group */
 	int		vec_agg_ngroups;	/* number of active groups */
 	int		vec_agg_cap;		/* allocated capacity of arrays */
