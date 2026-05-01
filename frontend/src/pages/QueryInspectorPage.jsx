@@ -205,6 +205,11 @@ export default function QueryInspectorPage() {
                     filtered={vectorized.filteredRows || 0}
                   />
                 )}
+                {vectorized.filteredRows == null && (
+                  <p className="inspector-params">
+                    Estimated plan only; actual filter counts are unavailable for vectorized scans.
+                  </p>
+                )}
               </div>
             </div>
           </div>

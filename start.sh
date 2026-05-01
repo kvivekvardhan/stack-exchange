@@ -24,6 +24,21 @@ warn() { echo -e "${YELLOW}  ⚠ $*${NC}"; }
 err()  { echo -e "${RED}  ✗ $*${NC}"; }
 step() { echo -e "\n${YELLOW}▶ $*${NC}"; }
 
+kill_matches() {
+  local label="$1"
+  local pattern="$2"
+  local pids
+
+  pids=$(pgrep -f "$pattern" 2>/dev/null || true)
+  if [ -n "$pids" ]; then
+    warn "Stopping stale $label processes..."
+    kill $pids 2>/dev/null || true
+    sleep 1
+    pids=$(pgrep -f "$pattern" 2>/dev/null || true)
+    [ -n "$pids" ] && kill -9 $pids 2>/dev/null || true
+  fi
+}
+
 echo ""
 echo "╔══════════════════════════════════════════╗"
 echo "║       StackFast — Starting Services      ║"
@@ -41,10 +56,10 @@ if ! [ -f "$PG_CUSTOM" ]; then
 fi
 
 # Kill any existing process on 5433
-PID_5433=$(lsof -ti tcp:5433 2>/dev/null)
+PID_5433=$(lsof -ti tcp:5433 -sTCP:LISTEN 2>/dev/null)
 if [ -n "$PID_5433" ]; then
   warn "Port 5433 in use by PID $PID_5433 — stopping it..."
-  kill "$PID_5433" 2>/dev/null
+  kill $PID_5433 2>/dev/null
   sleep 2
 fi
 
@@ -65,10 +80,10 @@ fi
 step "Checking Baseline PostgreSQL (port 5434)..."
 
 # Kill any ghost processes secretly holding port 5434
-PID_5434=$(lsof -ti tcp:5434 2>/dev/null)
+PID_5434=$(lsof -ti tcp:5434 -sTCP:LISTEN 2>/dev/null)
 if [ -n "$PID_5434" ]; then
   warn "Port 5434 in use by PID $PID_5434 — stopping it..."
-  kill -9 "$PID_5434" 2>/dev/null
+  kill -9 $PID_5434 2>/dev/null
   sleep 2
 fi
 
@@ -104,10 +119,12 @@ fi
 # ─────────────────────────────────────────────
 step "Starting Node.js backend (port 4000)..."
 
-PID_4000=$(lsof -ti tcp:4000 2>/dev/null)
+kill_matches "backend watcher" "$PROJECT_DIR/backend/node_modules/.bin/nodemon"
+
+PID_4000=$(lsof -ti tcp:4000 -sTCP:LISTEN 2>/dev/null)
 if [ -n "$PID_4000" ]; then
   warn "Port 4000 in use by PID $PID_4000 — stopping it..."
-  kill "$PID_4000" 2>/dev/null
+  kill $PID_4000 2>/dev/null
   sleep 1
 fi
 
@@ -115,9 +132,9 @@ cd "$PROJECT_DIR/backend"
 
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
-nvm use 18 # Ensure we are using modern Node
+nvm install 20 # Vite 8 requires Node 20.19+; installs if missing, switches if present
 
-nohup npm run dev > "$LOG_DIR/backend.log" 2>&1 &
+setsid nohup npm start > "$LOG_DIR/backend.log" 2>&1 &
 BACKEND_PID=$!
 sleep 3
 
@@ -134,15 +151,17 @@ fi
 # ─────────────────────────────────────────────
 step "Starting Vite frontend (port 5173)..."
 
-PID_5173=$(lsof -ti tcp:5173 2>/dev/null)
+kill_matches "frontend watcher" "$PROJECT_DIR/frontend/node_modules/.bin/vite"
+
+PID_5173=$(lsof -ti tcp:5173 -sTCP:LISTEN 2>/dev/null)
 if [ -n "$PID_5173" ]; then
   warn "Port 5173 in use by PID $PID_5173 — stopping it..."
-  kill "$PID_5173" 2>/dev/null
+  kill $PID_5173 2>/dev/null
   sleep 1
 fi
 
 cd "$PROJECT_DIR/frontend"
-nohup npm run dev > "$LOG_DIR/frontend.log" 2>&1 &
+setsid nohup npm run dev > "$LOG_DIR/frontend.log" 2>&1 &
 FRONTEND_PID=$!
 sleep 3
 

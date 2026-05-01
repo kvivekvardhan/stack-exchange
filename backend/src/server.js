@@ -1021,80 +1021,94 @@ app.post(
     const sql = normalized.sql;
 
     async function inspectEngine(engine) {
-      return withTransactionEngine(engine, async (client) => {
-        await client.query("SET TRANSACTION READ ONLY");
-        await client.query("SET LOCAL statement_timeout = 60000");
-        await client.query("SET LOCAL enable_indexscan = off");
-        await client.query("SET LOCAL enable_bitmapscan = off");
-        await client.query("SET LOCAL enable_hashagg = off");
-        await client.query("SET LOCAL max_parallel_workers_per_gather = 0");
+      try {
+        return await withTransactionEngine(engine, async (client) => {
+          await client.query("SET TRANSACTION READ ONLY");
+          await client.query("SET LOCAL statement_timeout = 60000");
+          await client.query("SET LOCAL enable_indexscan = off");
+          await client.query("SET LOCAL enable_bitmapscan = off");
+          await client.query("SET LOCAL enable_hashagg = off");
+          await client.query("SET LOCAL max_parallel_workers_per_gather = 0");
 
-        const start = process.hrtime.bigint();
-        let result, error = null;
-        try {
-          result = await client.query(sql, []);
-        } catch (err) {
-          error = err.message;
-          result = null;
-        }
-        const execMs = Number(hrtimeToMs(start).toFixed(3));
-
-        let plan = null;
-        let planJson = null;
-
-        if (!error) {
+          const start = process.hrtime.bigint();
+          let result, error = null;
           try {
-            const explainText = await client.query(
-              `EXPLAIN (ANALYZE, FORMAT TEXT) ${sql}`,
-              []
-            );
-            plan = explainText.rows.map((r) => r["QUERY PLAN"]).join("\n");
-          } catch (_) {}
-
-          try {
-            const explainJson = await client.query(
-              `EXPLAIN (ANALYZE, FORMAT JSON) ${sql}`,
-              []
-            );
-            planJson = explainJson.rows[0]["QUERY PLAN"];
-          } catch (_) {}
-        }
-
-        const isVectorized = plan ? plan.includes("Vectorized Seq Scan") : false;
-
-        let estimatedRows = null;
-        let filteredRows = null;
-
-        if (plan) {
-          const lines = plan.split("\n");
-          for (const line of lines) {
-            if (/(?:Vectorized Seq Scan|Seq Scan)\s+on\s+\w+/.test(line)) {
-              const rowsM = line.match(/actual time[^)]*rows=(\d+)/);
-              if (rowsM) estimatedRows = parseInt(rowsM[1], 10);
-            }
-            const filterM = line.match(/Rows Removed by Filter:\s*(\d+)/);
-            if (filterM) filteredRows = parseInt(filterM[1], 10);
+            result = await client.query(sql, []);
+          } catch (err) {
+            error = err.message;
+            result = null;
           }
-        }
+          const execMs = Number(hrtimeToMs(start).toFixed(3));
 
+          let plan = null;
+          let planJson = null;
+
+          if (!error) {
+            const explainTextSql = engine === "vectorized"
+              ? `EXPLAIN (FORMAT TEXT) ${sql}`
+              : `EXPLAIN (ANALYZE, FORMAT TEXT) ${sql}`;
+            const explainJsonSql = engine === "vectorized"
+              ? `EXPLAIN (FORMAT JSON) ${sql}`
+              : `EXPLAIN (ANALYZE, FORMAT JSON) ${sql}`;
+
+            try {
+              const explainText = await client.query(explainTextSql, []);
+              plan = explainText.rows.map((r) => r["QUERY PLAN"]).join("\n");
+            } catch (_) {}
+
+            try {
+              const explainJson = await client.query(explainJsonSql, []);
+              planJson = explainJson.rows[0]["QUERY PLAN"];
+            } catch (_) {}
+          }
+
+          const isVectorized = plan ? plan.includes("Vectorized Seq Scan") : false;
+
+          let estimatedRows = null;
+          let filteredRows = null;
+
+          if (plan) {
+            const lines = plan.split("\n");
+            for (const line of lines) {
+              if (/(?:Vectorized Seq Scan|Seq Scan)\s+on\s+\w+/.test(line)) {
+                const rowsM = line.match(/actual time[^)]*rows=(\d+)/) ||
+                  line.match(/cost=[^)]*rows=(\d+)/);
+                if (rowsM) estimatedRows = parseInt(rowsM[1], 10);
+              }
+              const filterM = line.match(/Rows Removed by Filter:\s*(\d+)/);
+              if (filterM) filteredRows = parseInt(filterM[1], 10);
+            }
+          }
+
+          return {
+            engine,
+            execMs,
+            rowCount: result ? result.rowCount : 0,
+            error,
+            plan,
+            planJson,
+            isVectorized,
+            estimatedRows: estimatedRows,
+            filteredRows: filteredRows
+          };
+        });
+      } catch (err) {
         return {
           engine,
-          execMs,
-          rowCount: result ? result.rowCount : 0,
-          error,
-          plan,
-          planJson,
-          isVectorized,
-          estimatedRows: estimatedRows,
-          filteredRows: filteredRows
+          execMs: 0,
+          rowCount: 0,
+          error: err.message,
+          plan: null,
+          planJson: null,
+          isVectorized: false,
+          estimatedRows: null,
+          filteredRows: null
         };
-      });
+      }
     }
 
-    const [baseline, vectorized] = await Promise.all([
-      inspectEngine("baseline"),
-      inspectEngine("vectorized")
-    ]);
+    const baseline = await inspectEngine("baseline");
+    const vectorized = await inspectEngine("vectorized");
 
     const speedup = baseline.execMs > 0 && vectorized.execMs > 0
       ? Number((baseline.execMs / vectorized.execMs).toFixed(2))
@@ -1127,6 +1141,16 @@ app.use((error, _req, res, _next) => {
   });
 });
 
-app.listen(port, () => {
+const server = app.listen(port, () => {
   console.log(`StackFast backend listening on http://localhost:${port}`);
+});
+
+server.on("error", (error) => {
+  if (error.code === "EADDRINUSE") {
+    console.error(`Port ${port} is already in use. Stop the existing backend or set PORT to another value.`);
+  } else {
+    console.error("Backend server failed to start", error);
+  }
+
+  process.exit(1);
 });

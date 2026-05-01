@@ -56,6 +56,25 @@ function handlePoolError(label) {
   };
 }
 
+function attachClientErrorLogger(client, label) {
+  const handleClientError = (error) => {
+    console.error(`Unexpected PostgreSQL client error (${label})`, error);
+  };
+
+  client.on("error", handleClientError);
+  return () => client.off("error", handleClientError);
+}
+
+async function rollbackQuietly(client, label) {
+  try {
+    await client.query("ROLLBACK");
+    return true;
+  } catch (error) {
+    console.error(`Failed to rollback PostgreSQL transaction (${label})`, error);
+    return false;
+  }
+}
+
 pool.on("error", handlePoolError("default"));
 baselinePool.on("error", handlePoolError("baseline"));
 vectorPool.on("error", handlePoolError("vectorized"));
@@ -84,21 +103,26 @@ export async function queryWithEngine(engine, text, params = []) {
 
 export async function withTransaction(work) {
   const client = await pool.connect();
+  const detachClientErrorLogger = attachClientErrorLogger(client, "default");
+  let shouldDiscardClient = false;
   try {
     await client.query("BEGIN");
     const result = await work(client);
     await client.query("COMMIT");
     return result;
   } catch (error) {
-    await client.query("ROLLBACK");
+    shouldDiscardClient = !(await rollbackQuietly(client, "default"));
     throw error;
   } finally {
-    client.release();
+    detachClientErrorLogger();
+    client.release(shouldDiscardClient);
   }
 }
 
 export async function withTransactionEngine(engine, work) {
   const client = await resolvePool(engine).connect();
+  const detachClientErrorLogger = attachClientErrorLogger(client, engine || "default");
+  let shouldDiscardClient = false;
   try {
     await client.query("BEGIN");
     if (shouldDisableParallelScans(engine)) {
@@ -108,10 +132,11 @@ export async function withTransactionEngine(engine, work) {
     await client.query("COMMIT");
     return result;
   } catch (error) {
-    await client.query("ROLLBACK");
+    shouldDiscardClient = !(await rollbackQuietly(client, engine || "default"));
     throw error;
   } finally {
-    client.release();
+    detachClientErrorLogger();
+    client.release(shouldDiscardClient);
   }
 }
 
