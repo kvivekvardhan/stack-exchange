@@ -381,7 +381,7 @@ ExecVecAggReset(AggState *aggstate)
 static bool
 ExecVecAggStrategySupported(AggStrategy strategy)
 {
-	return strategy == AGG_HASHED || strategy == AGG_SORTED;
+	return strategy == AGG_PLAIN || strategy == AGG_SORTED;
 }
 
 static int
@@ -2534,7 +2534,23 @@ ExecAgg(PlanState *pstate)
 	TupleTableSlot *result = NULL;
 
 	if (ExecVecAggMaybeEnable(node))
-		return ExecVecAgg(node);
+	{
+		TupleTableSlot *vec_result = ExecVecAgg(node);
+
+		if (vec_result != NULL || node->agg_done)
+			return vec_result;
+
+		/*
+		 * ExecVecAgg returned NULL without setting agg_done. This means it
+		 * discovered mid-execution that it cannot handle this plan shape
+		 * (e.g. ExecVecAggMatchesAggrefs returned false, or outer node shape
+		 * was unexpected). Disable the vec path and fall through to the
+		 * standard PostgreSQL aggregate executor so the query still returns
+		 * correct results.
+		 */
+		node->vec_agg_enabled = false;
+		node->agg_done = false;
+	}
 
 	CHECK_FOR_INTERRUPTS();
 
@@ -4744,6 +4760,30 @@ ExecEndAgg(AggState *node)
 
 	outerPlan = outerPlanState(node);
 	ExecEndNode(outerPlan);
+
+	/* Free vectorized aggregate accumulator arrays. */
+	if (node->vec_agg_keys)
+	{
+		pfree(node->vec_agg_keys);
+		node->vec_agg_keys = NULL;
+	}
+	if (node->vec_agg_sum_i64)
+	{
+		pfree(node->vec_agg_sum_i64);
+		node->vec_agg_sum_i64 = NULL;
+	}
+	if (node->vec_agg_score_count)
+	{
+		pfree(node->vec_agg_score_count);
+		node->vec_agg_score_count = NULL;
+	}
+	if (node->vec_agg_count)
+	{
+		pfree(node->vec_agg_count);
+		node->vec_agg_count = NULL;
+	}
+	node->vec_agg_cap = 0;
+	node->vec_agg_enabled = false;
 }
 
 void
@@ -4755,6 +4795,17 @@ ExecReScanAgg(AggState *node)
 	int			transno;
 	int			numGroupingSets = Max(node->maxsets, 1);
 	int			setno;
+
+	/*
+	 * Reset vectorized aggregate state so that re-execution (e.g. nested-loop
+	 * rescans or repeated EXPLAIN ANALYZE runs) starts fresh.
+	 * Setting vec_agg_enabled = false forces ExecVecAggMaybeEnable to
+	 * re-validate shape on next execution.
+	 */
+	node->vec_agg_drained = false;
+	node->vec_agg_emit_index = 0;
+	node->vec_agg_ngroups = 0;
+	node->vec_agg_enabled = false;
 
 	node->agg_done = false;
 
