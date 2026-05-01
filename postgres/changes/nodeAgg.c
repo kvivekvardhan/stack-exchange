@@ -382,7 +382,7 @@ ExecVecAggReset(AggState *aggstate)
 static bool
 ExecVecAggStrategySupported(AggStrategy strategy)
 {
-	return strategy == AGG_PLAIN || strategy == AGG_SORTED || strategy == AGG_HASHED;
+	return strategy == AGG_PLAIN || strategy == AGG_SORTED;
 }
 
 static int
@@ -448,8 +448,9 @@ ExecVecAggAccumulateSlot(AggState *aggstate, TupleTableSlot *slot,
 
 	if (slot == NULL || TupIsNull(slot) || slot->tts_tupleDescriptor == NULL ||
 		!AttributeNumberIsValid(group_attno) ||
-		!AttributeNumberIsValid(score_attno) ||
-		group_attno > slot->tts_tupleDescriptor->natts ||
+		group_attno > slot->tts_tupleDescriptor->natts)
+		return false;
+	if (AttributeNumberIsValid(score_attno) &&
 		score_attno > slot->tts_tupleDescriptor->natts)
 		return false;
 
@@ -458,12 +459,15 @@ ExecVecAggAccumulateSlot(AggState *aggstate, TupleTableSlot *slot,
 		return true;
 	group_key = DatumGetInt32(group_d);
 
-	score_d = slot_getattr(slot, score_attno, &isnull);
 	group_index = ExecVecAggFindOrAddGroup(aggstate, group_key);
-	if (!isnull)
+	if (AttributeNumberIsValid(score_attno))
 	{
-		aggstate->vec_agg_sum_i64[group_index] += (int64) DatumGetInt32(score_d);
-		aggstate->vec_agg_score_count[group_index]++;
+		score_d = slot_getattr(slot, score_attno, &isnull);
+		if (!isnull)
+		{
+			aggstate->vec_agg_sum_i64[group_index] += (int64) DatumGetInt32(score_d);
+			aggstate->vec_agg_score_count[group_index]++;
+		}
 	}
 	aggstate->vec_agg_count[group_index]++;
 
@@ -477,7 +481,7 @@ ExecVecAggMatchesAggrefs(AggState *aggstate, ScanState *scan)
 	bool		seen_avg = false;
 	bool		seen_count = false;
 
-	if (scan == NULL || !AttributeNumberIsValid(scan->vec_att_score))
+	if (scan == NULL)
 		return false;
 
 	foreach(lc, aggstate->aggs)
@@ -510,7 +514,8 @@ ExecVecAggMatchesAggrefs(AggState *aggstate, ScanState *scan)
 		if (tle == NULL || tle->expr == NULL || !IsA(tle->expr, Var))
 			return false;
 		v = castNode(Var, tle->expr);
-		if (v->vartype != INT4OID)
+		if (v->vartype != INT4OID ||
+			!AttributeNumberIsValid(scan->vec_att_score))
 			return false;
 		if (strcmp(aggname, "avg") != 0 ||
 			aggref->aggtype != NUMERICOID || seen_avg)
@@ -518,7 +523,7 @@ ExecVecAggMatchesAggrefs(AggState *aggstate, ScanState *scan)
 		seen_avg = true;
 	}
 
-	return seen_avg && seen_count;
+	return seen_avg || seen_count;
 }
 
 static AttrNumber
@@ -579,6 +584,7 @@ ExecVecAggMaybeEnable(AggState *aggstate)
 {
 	Agg		   *aggnode;
 	ScanState  *scan;
+	AttrNumber	score_attno;
 
 	if (aggstate == NULL)
 		return false;
@@ -591,19 +597,21 @@ ExecVecAggMaybeEnable(AggState *aggstate)
 	if (!ExecVecAggScanReady(scan))
 		return false;
 
+	score_attno = ExecVecAggAvgInputAttno(aggstate);
+
 	aggnode = castNode(Agg, aggstate->ss.ps.plan);
 	if (aggnode == NULL ||
-		aggnode->numCols != 1 ||
-		aggnode->grpColIdx == NULL ||
-		aggnode->grpColIdx[0] <= 0 ||
-		aggnode->groupingSets != NIL ||
-		aggstate->numaggs != 2 ||
+		aggnode->numCols < 0 ||
+		aggnode->numCols > 1 ||
+		(aggnode->numCols == 1 &&
+		 (aggnode->grpColIdx == NULL || aggnode->grpColIdx[0] <= 0)) ||
+		aggstate->numaggs <= 0 ||
 		aggstate->aggsplit != AGGSPLIT_SIMPLE ||
 		!ExecVecAggStrategySupported(aggstate->aggstrategy) ||
-		!AttributeNumberIsValid(ExecVecAggAvgInputAttno(aggstate)) ||
 		aggstate->ss.ps.qual != NULL ||
 		!AttributeNumberIsValid(scan->vec_att_posttype) ||
-		!AttributeNumberIsValid(scan->vec_att_score) ||
+		(AttributeNumberIsValid(score_attno) &&
+		 !AttributeNumberIsValid(scan->vec_att_score)) ||
 		!ExecVecAggMatchesAggrefs(aggstate, scan))
 		return false;
 
@@ -647,6 +655,7 @@ ExecVecAgg(AggState *aggstate)
 	int		   g;
 	int		   grp_attno;
 	AttrNumber score_attno;
+	bool		has_avg;
 
 	if (!ExecVecAggReady(aggstate, &scan))
 		return NULL;
@@ -666,17 +675,15 @@ ExecVecAgg(AggState *aggstate)
 		!ExecVecAggMatchesAggrefs(aggstate, scan))
 		return NULL;
 
-	if (aggnode->numCols != 1 ||
-		aggnode->grpColIdx == NULL ||
-		aggnode->grpColIdx[0] <= 0)
+	if (aggnode->numCols < 0 ||
+		aggnode->numCols > 1 ||
+		(aggnode->numCols == 1 &&
+		 (aggnode->grpColIdx == NULL || aggnode->grpColIdx[0] <= 0)))
 		return NULL;
 
-	grp_attno = aggnode->grpColIdx[0];
+	grp_attno = (aggnode->numCols == 1) ? aggnode->grpColIdx[0] : InvalidAttrNumber;
 	score_attno = ExecVecAggAvgInputAttno(aggstate);
-	if (grp_attno <= 0)
-		return NULL;
-	if (!AttributeNumberIsValid(score_attno))
-		return NULL;
+	has_avg = AttributeNumberIsValid(score_attno);
 
 	outer_slot = econtext->ecxt_outertuple;
 	if (outer_slot == NULL)
@@ -724,13 +731,16 @@ ExecVecAgg(AggState *aggstate)
 					else
 						grp_key = 0;
 
-					score_null = vss->batch_nulls[base + score_attno - 1];
 					g = ExecVecAggFindOrAddGroup(aggstate, grp_key);
-					if (!score_null)
+					if (has_avg)
 					{
-						aggstate->vec_agg_sum_i64[g] +=
-							(int64) DatumGetInt32(vss->batch_values[base + score_attno - 1]);
-						aggstate->vec_agg_score_count[g]++;
+						score_null = vss->batch_nulls[base + score_attno - 1];
+						if (!score_null)
+						{
+							aggstate->vec_agg_sum_i64[g] +=
+								(int64) DatumGetInt32(vss->batch_values[base + score_attno - 1]);
+							aggstate->vec_agg_score_count[g]++;
+						}
 					}
 					aggstate->vec_agg_count[g]++;
 				}
@@ -803,15 +813,18 @@ ExecVecAgg(AggState *aggstate)
 			}
 		}
 
-		ExecClearTuple(outer_slot);
-		MemSet(outer_slot->tts_values, 0, outer_slot->tts_tupleDescriptor->natts * sizeof(Datum));
-		MemSet(outer_slot->tts_isnull, true, outer_slot->tts_tupleDescriptor->natts * sizeof(bool));
-		outer_slot->tts_values[grp_attno - 1] = Int32GetDatum(aggstate->vec_agg_keys[g]);
-		outer_slot->tts_isnull[grp_attno - 1] = false;
-		ExecStoreVirtualTuple(outer_slot);
+		if (AttributeNumberIsValid(grp_attno))
+		{
+			ExecClearTuple(outer_slot);
+			MemSet(outer_slot->tts_values, 0, outer_slot->tts_tupleDescriptor->natts * sizeof(Datum));
+			MemSet(outer_slot->tts_isnull, true, outer_slot->tts_tupleDescriptor->natts * sizeof(bool));
+			outer_slot->tts_values[grp_attno - 1] = Int32GetDatum(aggstate->vec_agg_keys[g]);
+			outer_slot->tts_isnull[grp_attno - 1] = false;
+			ExecStoreVirtualTuple(outer_slot);
 
-		econtext->ecxt_outertuple = outer_slot;
-		econtext->ecxt_scantuple = outer_slot;
+			econtext->ecxt_outertuple = outer_slot;
+			econtext->ecxt_scantuple = outer_slot;
+		}
 
 		result = ExecProject(projInfo);
 		return result;
