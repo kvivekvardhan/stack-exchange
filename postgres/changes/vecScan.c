@@ -27,6 +27,7 @@ typedef struct VecScanState
 	CustomScanState css;
 	TableScanDesc scandesc;
 	TupleTableSlot *scan_slot;
+	TupleTableSlot *result_slot;
 	HeapTuple  *batch_tuples;
 	int			batch_count;
 	int			batch_index;
@@ -44,6 +45,9 @@ static Node *VecCreateCustomScanState(CustomScan *cscan);
 static Plan *VecPlanCustomPath(PlannerInfo *root, RelOptInfo *rel,
 							   CustomPath *best_path, List *tlist,
 							   List *clauses, List *custom_plans);
+static void VecClearBatch(VecScanState *vstate);
+static TupleTableSlot *VecStoreVirtualScanTuple(TupleTableSlot *src,
+												TupleTableSlot *dst);
 
 #ifndef VEC_BATCH_SIZE
 #define VEC_BATCH_SIZE 1000
@@ -126,6 +130,8 @@ VecBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 	vstate->scan_slot = ExecInitExtraTupleSlot(estate,
 											  RelationGetDescr(node->ss.ss_currentRelation),
 											  table_slot_callbacks(node->ss.ss_currentRelation));
+	vstate->result_slot = MakeSingleTupleTableSlot(RelationGetDescr(node->ss.ss_currentRelation),
+												  &TTSOpsHeapTuple);
 	vstate->batch_tuples = (HeapTuple *) palloc0(VEC_BATCH_SIZE * sizeof(HeapTuple));
 	vstate->batch_count = 0;
 	vstate->batch_index = 0;
@@ -149,6 +155,41 @@ VecBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 }
 
 static void
+VecClearBatch(VecScanState *vstate)
+{
+	int			i;
+
+	if (vstate->result_slot != NULL)
+		ExecClearTuple(vstate->result_slot);
+
+	for (i = 0; i < vstate->batch_count; i++)
+	{
+		if (vstate->batch_tuples[i] != NULL)
+		{
+			heap_freetuple(vstate->batch_tuples[i]);
+			vstate->batch_tuples[i] = NULL;
+		}
+	}
+
+	vstate->batch_count = 0;
+	vstate->batch_index = 0;
+}
+
+static TupleTableSlot *
+VecStoreVirtualScanTuple(TupleTableSlot *src, TupleTableSlot *dst)
+{
+	int			natts = dst->tts_tupleDescriptor->natts;
+
+	slot_getsomeattrs(src, natts);
+	ExecClearTuple(dst);
+	memcpy(dst->tts_values, src->tts_values, natts * sizeof(Datum));
+	memcpy(dst->tts_isnull, src->tts_isnull, natts * sizeof(bool));
+	ExecStoreVirtualTuple(dst);
+
+	return dst;
+}
+
+static void
 VecFillBatch(VecScanState *vstate)
 {
 	CustomScanState *node = &vstate->css;
@@ -156,11 +197,11 @@ VecFillBatch(VecScanState *vstate)
 	ExprContext *econtext = node->ss.ps.ps_ExprContext;
 	ExprState  *qual = node->ss.ps.qual;
 	TupleTableSlot *slot = vstate->scan_slot;
+	TupleTableSlot *expr_slot = node->ss.ss_ScanTupleSlot;
 	ScanDirection direction = estate->es_direction;
 	int			i;
 
-	vstate->batch_index = 0;
-	vstate->batch_count = 0;
+	VecClearBatch(vstate);
 
 	if (vstate->scandesc == NULL)
 		vstate->scandesc = table_beginscan(node->ss.ss_currentRelation,
@@ -178,7 +219,8 @@ VecFillBatch(VecScanState *vstate)
 		}
 
 		ResetExprContext(econtext);
-		econtext->ecxt_scantuple = slot;
+		VecStoreVirtualScanTuple(slot, expr_slot);
+		econtext->ecxt_scantuple = expr_slot;
 
 		if (qual != NULL)
 			pass = ExecQual(qual, econtext);
@@ -216,17 +258,24 @@ VecExecCustomScan(CustomScanState *node)
 			if (tup == NULL)
 				continue;
 
-			ExecForceStoreHeapTuple(tup, vstate->scan_slot, true);
-			econtext->ecxt_scantuple = vstate->scan_slot;
+			ExecForceStoreHeapTuple(tup, vstate->result_slot, false);
+			VecStoreVirtualScanTuple(vstate->result_slot, node->ss.ss_ScanTupleSlot);
+			econtext->ecxt_scantuple = node->ss.ss_ScanTupleSlot;
 
 			if (projInfo != NULL)
+			{
+				projInfo->pi_exprContext->ecxt_scantuple = node->ss.ss_ScanTupleSlot;
 				return ExecProject(projInfo);
+			}
 
-			return vstate->scan_slot;
+			return node->ss.ss_ScanTupleSlot;
 		}
 
 		if (vstate->batch_done)
+		{
+			VecClearBatch(vstate);
 			return NULL;
+		}
 	}
 }
 
@@ -237,6 +286,11 @@ VecEndCustomScan(CustomScanState *node)
 
 	if (vstate->scandesc != NULL)
 		table_endscan(vstate->scandesc);
+
+	VecClearBatch(vstate);
+
+	if (vstate->result_slot != NULL)
+		ExecDropSingleTupleTableSlot(vstate->result_slot);
 
 	elog(DEBUG1,
 		 "Vectorized CustomScan complete: " INT64_FORMAT " passed, " INT64_FORMAT " filtered",
@@ -252,8 +306,7 @@ VecReScanCustomScan(CustomScanState *node)
 	if (vstate->scandesc != NULL)
 		table_rescan(vstate->scandesc, NULL);
 
-	vstate->batch_count = 0;
-	vstate->batch_index = 0;
+	VecClearBatch(vstate);
 	vstate->batch_done = false;
 	vstate->total_passed = 0;
 	vstate->total_filtered = 0;
