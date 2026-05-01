@@ -82,6 +82,15 @@ export async function queryWithEngine(engine, text, params = []) {
   return resolvePool(engine).query(text, params);
 }
 
+export async function discardEngineSession(engine) {
+  const client = await resolvePool(engine).connect();
+  try {
+    await client.query("DISCARD ALL");
+  } finally {
+    client.release();
+  }
+}
+
 export async function withTransaction(work) {
   const client = await pool.connect();
   try {
@@ -90,7 +99,11 @@ export async function withTransaction(work) {
     await client.query("COMMIT");
     return result;
   } catch (error) {
-    await client.query("ROLLBACK");
+    try {
+      await client.query("ROLLBACK");
+    } catch (rollbackError) {
+      console.error("Failed to rollback PostgreSQL transaction", rollbackError);
+    }
     throw error;
   } finally {
     client.release();
@@ -108,7 +121,11 @@ export async function withTransactionEngine(engine, work) {
     await client.query("COMMIT");
     return result;
   } catch (error) {
-    await client.query("ROLLBACK");
+    try {
+      await client.query("ROLLBACK");
+    } catch (rollbackError) {
+      console.error(`Failed to rollback PostgreSQL transaction (${engine})`, rollbackError);
+    }
     throw error;
   } finally {
     client.release();

@@ -39,7 +39,18 @@ async function request(path, params = {}, options = {}) {
     body: options.body ? JSON.stringify(options.body) : undefined,
     signal: options.signal
   });
-  const payload = await response.json();
+  const responseText = await response.text();
+  let payload = null;
+  if (responseText) {
+    try {
+      payload = JSON.parse(responseText);
+    } catch (_error) {
+      const message = response.ok
+        ? "API returned an invalid JSON response"
+        : responseText.slice(0, 200) || "API request failed";
+      throw new Error(message);
+    }
+  }
 
   if (!response.ok) {
     const message = payload?.error?.message || "API request failed";

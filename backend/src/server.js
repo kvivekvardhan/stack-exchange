@@ -1,6 +1,11 @@
 import cors from "cors";
 import express from "express";
-import { query, queryWithEngine, withTransactionEngine } from "./db/pool.js";
+import {
+  discardEngineSession,
+  query,
+  queryWithEngine,
+  withTransactionEngine
+} from "./db/pool.js";
 
 const app = express();
 const port = process.env.PORT || 4000;
@@ -185,8 +190,6 @@ function median(arr) {
 
 async function runQuery(engine, sql, params = [], options = {}) {
   return withTransactionEngine(engine, async (client) => {
-    // Always disable parallelism for a fair comparison between engines
-    await client.query("SET LOCAL max_parallel_workers_per_gather = 0");
     if (options.disableHashAgg) {
       await client.query("SET LOCAL enable_hashagg = off");
     }
@@ -959,9 +962,7 @@ app.get(
         let lastOutcome;
         for (let i = 0; i < BENCH_RUNS; i++) {
           // Flush PostgreSQL plan cache and temp state between runs for fair measurement
-          await withTransactionEngine(engine, async (client) => {
-            await client.query("DISCARD ALL");
-          });
+          await discardEngineSession(engine);
           lastOutcome = await runQuery(engine, item.sql, item.params, {
             inspect,
             disableHashAgg: item.disableHashAgg
@@ -1040,7 +1041,6 @@ app.post(
         const execMs = Number(hrtimeToMs(start).toFixed(3));
 
         let plan = null;
-        let planJson = null;
 
         if (!error) {
           try {
@@ -1049,14 +1049,6 @@ app.post(
               []
             );
             plan = explainText.rows.map((r) => r["QUERY PLAN"]).join("\n");
-          } catch (_) {}
-
-          try {
-            const explainJson = await client.query(
-              `EXPLAIN (ANALYZE, FORMAT JSON) ${sql}`,
-              []
-            );
-            planJson = explainJson.rows[0]["QUERY PLAN"];
           } catch (_) {}
         }
 
@@ -1083,7 +1075,6 @@ app.post(
           rowCount: result ? result.rowCount : 0,
           error,
           plan,
-          planJson,
           isVectorized,
           estimatedRows: estimatedRows,
           filteredRows: filteredRows

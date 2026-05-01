@@ -78,7 +78,8 @@ else
   warn "Baseline PG not running — starting it..."
   
   # Try the main system wrapper to start the baseline cluster safely
-  PG17_VERSION=$(ls /etc/postgresql/ | head -1)
+  # PG17_VERSION=$(ls /etc/postgresql/ | head -1)
+  PG17_VERSION=17
   if [ -n "$PG17_VERSION" ]; then
     sudo pg_ctlcluster $PG17_VERSION baseline start
     START_STATUS=$?
