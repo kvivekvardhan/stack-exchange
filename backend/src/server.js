@@ -178,8 +178,15 @@ function mapSearchQuestion(row) {
   };
 }
 
+function median(arr) {
+  const sorted = [...arr].sort((a, b) => a - b);
+  return Number(sorted[Math.floor(sorted.length / 2)].toFixed(3));
+}
+
 async function runQuery(engine, sql, params = [], options = {}) {
   return withTransactionEngine(engine, async (client) => {
+    // Always disable parallelism for a fair comparison between engines
+    await client.query("SET LOCAL max_parallel_workers_per_gather = 0");
     if (options.disableHashAgg) {
       await client.query("SET LOCAL enable_hashagg = off");
     }
@@ -903,6 +910,8 @@ app.get(
     const tagTerm = String(req.query.tag || "").trim().toLowerCase();
     const tagFilter = formatTagFilter(tagTerm);
 
+    const BENCH_RUNS = 3;
+
     const queries = [
       {
         name: "search",
@@ -942,26 +951,36 @@ app.get(
       }
     ];
 
+    // Run a single engine sequentially: flush cache before each run, then record median
     async function runBenchmark(engine) {
       const results = [];
       for (const item of queries) {
-        const outcome = await runQuery(engine, item.sql, item.params, {
-          inspect,
-          disableHashAgg: item.disableHashAgg
-        });
+        const timings = [];
+        let lastOutcome;
+        for (let i = 0; i < BENCH_RUNS; i++) {
+          // Flush PostgreSQL plan cache and temp state between runs for fair measurement
+          await withTransactionEngine(engine, async (client) => {
+            await client.query("DISCARD ALL");
+          });
+          lastOutcome = await runQuery(engine, item.sql, item.params, {
+            inspect,
+            disableHashAgg: item.disableHashAgg
+          });
+          timings.push(lastOutcome.timingMs);
+        }
         results.push({
           name: item.name,
-          timingMs: outcome.timingMs,
-          plan: inspect ? outcome.plan : null
+          timingMs: median(timings),
+          allRuns: timings,
+          plan: inspect ? lastOutcome.plan : null
         });
       }
       return results;
     }
 
-    const [baseline, vectorized] = await Promise.all([
-      runBenchmark("baseline"),
-      runBenchmark("vectorized")
-    ]);
+    // Run SEQUENTIALLY: baseline first, then vectorized — never in parallel
+    const baseline = await runBenchmark("baseline");
+    const vectorized = await runBenchmark("vectorized");
 
     const inspector = inspect
       ? queries.map((item, index) => ({
@@ -981,6 +1000,7 @@ app.get(
     res.json({
       meta: {
         query: { q: searchTerm, tag: tagTerm },
+        benchRuns: BENCH_RUNS,
         inspector
       },
       data: {
@@ -1003,11 +1023,11 @@ app.post(
     async function inspectEngine(engine) {
       return withTransactionEngine(engine, async (client) => {
         await client.query("SET TRANSACTION READ ONLY");
-        // Use a generous timeout for EXPLAIN ANALYZE on large tables
         await client.query("SET LOCAL statement_timeout = 60000");
         await client.query("SET LOCAL enable_indexscan = off");
         await client.query("SET LOCAL enable_bitmapscan = off");
         await client.query("SET LOCAL enable_hashagg = off");
+        await client.query("SET LOCAL max_parallel_workers_per_gather = 0");
 
         const start = process.hrtime.bigint();
         let result, error = null;
@@ -1040,7 +1060,6 @@ app.post(
           } catch (_) {}
         }
 
-        // Parse vectorized scan info from plan text — line by line for reliability
         const isVectorized = plan ? plan.includes("Vectorized Seq Scan") : false;
 
         let estimatedRows = null;
@@ -1049,14 +1068,10 @@ app.post(
         if (plan) {
           const lines = plan.split("\n");
           for (const line of lines) {
-            // Find the seq scan node line: "-> Vectorized Seq Scan ... (actual time=... rows=NNN loops=1)"
             if (/(?:Vectorized Seq Scan|Seq Scan)\s+on\s+\w+/.test(line)) {
-              // actual rows returned by the scan after filter
               const rowsM = line.match(/actual time[^)]*rows=(\d+)/);
               if (rowsM) estimatedRows = parseInt(rowsM[1], 10);
-              // filter removal count on the NEXT line
             }
-            // Rows Removed by Filter — always on its own line
             const filterM = line.match(/Rows Removed by Filter:\s*(\d+)/);
             if (filterM) filteredRows = parseInt(filterM[1], 10);
           }

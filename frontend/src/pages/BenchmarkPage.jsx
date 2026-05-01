@@ -63,6 +63,7 @@ export default function BenchmarkPage() {
 
   const baseline = benchmark?.baseline || [];
   const vectorized = benchmark?.vectorized || [];
+  const benchRuns = meta?.benchRuns || 3;
 
   return (
     <section className="benchmark-page">
@@ -91,33 +92,56 @@ export default function BenchmarkPage() {
         <button type="submit">Run benchmark</button>
       </form>
 
-      {loading && <p className="status loading">Running benchmark...</p>}
+      {loading && (
+        <p className="status loading">
+          Running benchmark — each engine runs {benchRuns} times sequentially with cache flush between runs.
+          This takes ~20–40s. Please wait…
+        </p>
+      )}
       {error && <p className="status error">{error}</p>}
 
       {!loading && !error && benchmark && (
-        <div className="benchmark-table">
-          <div className="benchmark-row header">
-            <span>Query</span>
-            <span>Baseline (ms)</span>
-            <span>Vectorized (ms)</span>
-            <span>Speedup</span>
+        <>
+          <p className="status" style={{ fontSize: "0.85em", color: "var(--color-text-muted, #888)", marginBottom: "0.5rem" }}>
+            Median of {benchRuns} runs per query. Cache flushed (DISCARD ALL) before each run.
+            Parallelism disabled for fair comparison.
+          </p>
+          <div className="benchmark-table">
+            <div className="benchmark-row header">
+              <span>Query</span>
+              <span>Baseline median (ms)</span>
+              <span>Vectorized median (ms)</span>
+              <span>Speedup</span>
+              <span>Baseline runs (ms)</span>
+              <span>Vectorized runs (ms)</span>
+            </div>
+            {baseline.map((item, index) => {
+              const vector = vectorized[index];
+              const speedup =
+                vector && vector.timingMs > 0
+                  ? (item.timingMs / vector.timingMs).toFixed(2)
+                  : "-";
+              const baseRuns = item.allRuns ? item.allRuns.map(t => t.toFixed(1)).join(" / ") : "-";
+              const vecRuns = vector?.allRuns ? vector.allRuns.map(t => t.toFixed(1)).join(" / ") : "-";
+              const speedupNum = parseFloat(speedup);
+              const speedupColor =
+                isNaN(speedupNum) ? "inherit"
+                : speedupNum >= 2 ? "#2a9d8f"
+                : speedupNum >= 1.2 ? "#e9c46a"
+                : "#e76f51";
+              return (
+                <div key={item.name} className="benchmark-row">
+                  <span>{item.name}</span>
+                  <span>{item.timingMs.toFixed(3)}</span>
+                  <span>{vector ? vector.timingMs.toFixed(3) : "-"}</span>
+                  <span style={{ fontWeight: "bold", color: speedupColor }}>{speedup}x</span>
+                  <span style={{ fontSize: "0.8em", color: "var(--color-text-muted, #888)" }}>{baseRuns}</span>
+                  <span style={{ fontSize: "0.8em", color: "var(--color-text-muted, #888)" }}>{vecRuns}</span>
+                </div>
+              );
+            })}
           </div>
-          {baseline.map((item, index) => {
-            const vector = vectorized[index];
-            const speedup =
-              vector && vector.timingMs > 0
-                ? (item.timingMs / vector.timingMs).toFixed(2)
-                : "-";
-            return (
-              <div key={item.name} className="benchmark-row">
-                <span>{item.name}</span>
-                <span>{item.timingMs.toFixed(3)}</span>
-                <span>{vector ? vector.timingMs.toFixed(3) : "-"}</span>
-                <span>{speedup}x</span>
-              </div>
-            );
-          })}
-        </div>
+        </>
       )}
 
       {meta?.inspector && meta.inspector.length > 0 && (
